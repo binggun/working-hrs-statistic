@@ -1,0 +1,18 @@
+{
+  "name": "pawhub",
+  "private": true,
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "build": "npm run build -w web",
+    "test": "npm test -w server",
+    "dev:api": "npm run dev -w server",
+    "dev:web": "npm run dev -w web"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "prettier": "^3.9.9"
+  }
+}
