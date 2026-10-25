@@ -21,7 +21,7 @@ const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
 try {
   await page.goto(process.env.WEB_TEST_URL || "http://localhost:5173");
-  await page.getByLabel("Email", { exact: true }).fill(credentials.email);
+  await page.getByLabel("Email or employee ID (4 digits)", { exact: true }).fill(credentials.email);
   await page.getByLabel("Password", { exact: true }).fill(credentials.password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page
@@ -62,7 +62,7 @@ try {
   const download = await downloadPromise;
   assert.ok(download.suggestedFilename().endsWith(".pdf"));
   await page.screenshot({
-    path: process.env.SCREENSHOT_PATH || "/tmp/pawhub-manager.png",
+    path: process.env.SCREENSHOT_PATH || "/tmp/Pawhub-manager.png",
     fullPage: true,
   });
   assert.deepEqual(errors, []);

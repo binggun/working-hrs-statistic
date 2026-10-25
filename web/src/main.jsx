@@ -1,10 +1,13 @@
 import { DateTime } from "luxon";
+import { operationId } from "./operationId.js";
+import WorkerPortal from "./WorkerPortal.jsx";
+import AttendanceRecordDialog from "./AttendanceRecordDialog.jsx";
 import React, { useState, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import "@tabler/core/dist/css/tabler.min.css";
 import "./style.css";
 const API =
-  (import.meta.env.VITE_API_URL || "http://localhost:3000") + "/api/v1";
+  (import.meta.env.VITE_API_URL || "").replace(/\/$/, "") + "/api/v1";
 function App() {
   const [session, setSession] = useState(
     sessionStorage.getItem("pawhubSession") || "",
@@ -37,9 +40,11 @@ function App() {
     new URLSearchParams(location.hash.slice(1)).get("activate"),
   );
   const [refresh, setRefresh] = useState(0);
+  const [attendanceDialog, setAttendanceDialog] = useState(null);
   async function api(path, options = {}) {
+    const { responseType, ...requestOptions } = options;
     const response = await fetch(API + path, {
-      ...options,
+      ...requestOptions,
       headers: {
         "Content-Type": "application/json",
         ...(session ? { Authorization: "Bearer " + session } : {}),
@@ -53,8 +58,24 @@ function App() {
         setSession("");
         setMe(null);
       }
-      throw Error(e.error?.message || "Request failed");
+      const fields = e.error?.fields;
+      const details = Array.isArray(fields)
+        ? fields
+            .map((issue) => {
+              const label =
+                {
+                  name: "Name",
+                  email: "Email",
+                }[issue.path?.[0]] ||
+                issue.path?.join(".") ||
+                "Request";
+              return `${label}: ${issue.message}`;
+            })
+            .join("; ")
+        : "";
+      throw Object.assign(Error(details || e.error?.message || "Request failed"), { status: response.status });
     }
+    if (responseType === "blob") return response.blob();
     return (await response.json()).data;
   }
   async function task(fn) {
@@ -73,17 +94,22 @@ function App() {
     if (!session) return;
     let active = true;
     task(async () => {
-      const [a, s, w] = await Promise.all([
-        api("/me"),
-        api("/manager/shops"),
-        api("/manager/workers"),
-      ]);
+      const a = await api("/me");
+      if (!active) return;
+      if (a.role === "WORKER") {
+        setMe(a);
+        setWorkers([]);
+        setManagers([]);
+        return;
+      }
+      if (!["MANAGER", "SUPER_MANAGER"].includes(a.role))
+        throw Error("Store accounts use the Android app. Please sign out.");
+      const [s, w] = await Promise.all([api("/manager/shops"), api("/manager/workers")]);
       if (active) {
         setMe(a);
         setShops(s);
         setWorkers(w);
-        if (a.role === "SUPER_MANAGER")
-          setManagers(await api("/manager/managers"));
+        if (a.role === "SUPER_MANAGER") setManagers(await api("/manager/managers"));
       }
     });
     return () => {
@@ -96,7 +122,7 @@ function App() {
     ...(worker ? { workerId: worker } : {}),
   }).toString();
   useEffect(() => {
-    if (!me) return;
+    if (!me || me.role === "WORKER") return;
     let active = true;
     const path =
       page === "Hours"
@@ -149,9 +175,11 @@ function App() {
     e.preventDefault();
     const b = Object.fromEntries(new FormData(e.target));
     await task(async () => {
-      const a = await api("/manager/auth/login", {
+      const identifier = String(b.identifier).trim();
+      const accountId = /^\d{4}$/.test(identifier) ? identifier : null;
+      const a = await api("/auth/login", {
         method: "POST",
-        body: JSON.stringify(b),
+        body: JSON.stringify({ ...(accountId ? { accountId } : { email: identifier }), password: b.password }),
       });
       sessionStorage.setItem("pawhubSession", a.sessionToken);
       setSession(a.sessionToken);
@@ -159,11 +187,12 @@ function App() {
   }
   async function requestReset(e) {
     e.preventDefault();
-    const email = new FormData(e.target).get("email");
+    const identifier = String(new FormData(e.target).get("identifier")).trim();
+    const body = /^\d{4}$/.test(identifier) ? { accountId: identifier } : { email: identifier };
     await task(async () => {
       await api("/auth/password-links", {
         method: "POST",
-        body: JSON.stringify({ email }),
+        body: JSON.stringify(body),
       });
       setNotice(
         "If this account exists, a password reset email has been queued.",
@@ -189,27 +218,35 @@ function App() {
   }
   async function addPerson(e) {
     e.preventDefault();
-    const b = Object.fromEntries(new FormData(e.target));
-    const kind = b.kind;
-    delete b.kind;
-    b.shopIds = new FormData(e.target).getAll("shopIds");
-    b.operationId = crypto.randomUUID();
+    const form = e.currentTarget;
+    const data = new FormData(form);
     await task(async () => {
-      await api("/manager/" + (kind === "manager" ? "managers" : "workers"), {
-        method: "POST",
-        body: JSON.stringify(b),
-      });
-      e.target.reset();
+      const name = data.get("name").trim();
+      if (!name) throw Error("Name: enter a name.");
+      const body = {
+        name,
+        email: data.get("email").trim(),
+        operationId: operationId(),
+      };
+      await api(
+        "/manager/" + (data.get("kind") === "manager" ? "managers" : "workers"),
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        },
+      );
+      form.reset();
       setNotice("Account created; invitation queued.");
       setRefresh((x) => x + 1);
     });
   }
+
   async function decision(r, value) {
     await task(async () => {
       await api("/manager/validations/" + r.id + "/decision", {
         method: "POST",
         body: JSON.stringify({
-          operationId: crypto.randomUUID(),
+          operationId: operationId(),
           decision: value,
           expectedRecordVersion: r.version,
         }),
@@ -224,12 +261,13 @@ function App() {
   }
   async function correct(e) {
     e.preventDefault();
+    if (history?.record.effective_deleted) { setError("Removed records cannot be adjusted."); return; }
     const value = new FormData(e.target).get("occurredAt");
     await task(async () => {
       await api("/manager/attendance/" + history.record.id + "/corrections", {
         method: "POST",
         body: JSON.stringify({
-          operationId: crypto.randomUUID(),
+          operationId: operationId(),
           expectedRecordVersion: history.record.version,
           occurredAt: DateTime.fromISO(value, { zone: "Pacific/Auckland" })
             .toUTC()
@@ -237,6 +275,7 @@ function App() {
         }),
       });
       setHistory(null);
+      setNotice("Adjustment submitted. Pending manager approval.");
       setRefresh((x) => x + 1);
     });
   }
@@ -249,7 +288,7 @@ function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          operationId: crypto.randomUUID(),
+          operationId: operationId(),
           month,
           ...(shop ? { shopId: shop } : {}),
           ...(worker ? { workerId: worker } : {}),
@@ -261,7 +300,7 @@ function App() {
       const url = URL.createObjectURL(await r.blob());
       const a = document.createElement("a");
       a.href = url;
-      a.download = "pawhub-" + month + ".pdf";
+      a.download = "Pawhub-" + month + ".pdf";
       a.click();
       URL.revokeObjectURL(url);
     });
@@ -271,7 +310,7 @@ function App() {
       <div className="page page-center">
         <div className="container-tight py-4">
           <div className="brand text-center mb-4">
-            pawhub<span>Manager workspace</span>
+            Pawhub<span>Attendance workspace</span>
           </div>
           <form
             className="card card-md"
@@ -301,7 +340,7 @@ function App() {
                 )
               ) : (
                 <>
-                  {field("email", "Email", "email")}
+                  {field("identifier", "Email or employee ID (4 digits)")}
                   {!resetRequest && field("password", "Password", "password")}
                 </>
               )}
@@ -331,12 +370,25 @@ function App() {
         </div>
       </div>
     );
+  const logout = async () => {
+    try { await api("/auth/logout", { method: "POST" }); }
+    finally {
+      sessionStorage.removeItem("pawhubSession");
+      setSession(""); setMe(null); setRows([]); setHistory(null);
+      setShops([]); setWorkers([]); setManagers([]); setError("");
+    }
+  };
+  if (!me) return <main className="container py-5">
+    <p role="status">{error || "Loading account…"}</p>
+    <button className="btn" onClick={() => task(logout)}>Sign out</button>
+  </main>;
+  if (me.role === "WORKER") return <WorkerPortal account={me} api={api} logout={logout} session={session} />;
   return (
     <div className="page">
       <aside className="navbar navbar-vertical navbar-expand-lg">
         <div className="container-fluid">
           <div className="brand my-4">
-            pawhub<span>Manager workspace</span>
+            Pawhub<span>Manager workspace</span>
           </div>
           <nav className="nav flex-column w-100">
             {[
@@ -539,6 +591,12 @@ function App() {
           )}
           {page === "Records" && (
             <>
+              <button className="btn btn-primary mb-3" disabled={busy || !shops.length} onClick={() => setAttendanceDialog({ mode: "ADD" })}>Add attendance record</button>
+              {attendanceDialog && <AttendanceRecordDialog mode={attendanceDialog.mode} record={attendanceDialog.record}
+                shops={shops} workers={workers} defaultShop={shop} defaultWorker={worker} api={api}
+                endpoint="/manager/attendance-adjustments" onClose={() => setAttendanceDialog(null)}
+                onDone={() => { setAttendanceDialog(null); setHistory(null); setRefresh((v) => v + 1);
+                  setNotice(attendanceDialog.mode === "REMOVE" ? "Record marked as removal; original data retained. Pending approval." : "Manual record added. Pending approval."); }} />}
               <Table
                 headers={[
                   "Person / Shop",
@@ -553,17 +611,16 @@ function App() {
                   r.sign_type,
                   date(r.original_occurred_at),
                   date(r.confirmed_occurred_at),
-                  r.pending
+                  r.record_status === "removal" ? (r.pending ? "Removal · pending approval" : "Removal") : r.pending
                     ? "Pending"
                     : r.confirmed_deleted
                       ? "Deleted"
                       : "Confirmed",
-                  <button
-                    className="btn btn-sm"
-                    onClick={() => showHistory(r.id)}
-                  >
-                    View / adjust
-                  </button>,
+                  <div className="d-flex gap-2">
+                    <button className="btn btn-sm" onClick={() => showHistory(r.id)}>{r.effective_deleted ? "View details" : "View / adjust"}</button>
+                    <button className="btn btn-sm btn-outline-danger" disabled={busy || r.pending || r.effective_deleted}
+                      onClick={() => setAttendanceDialog({ mode: "REMOVE", record: r })}>Remove</button>
+                  </div>,
                 ])}
               />
               <div className="mt-3">
@@ -650,24 +707,15 @@ function App() {
                       </label>
                     </div>
                     <div className="col-md-6">
-                      <label className="form-label">Assigned shops</label>
-                      {shops.map((s) => (
-                        <label key={s.id} className="form-check mb-2">
-                          <input
-                            type="checkbox"
-                            name="shopIds"
-                            value={s.shopId}
-                            className="form-check-input"
-                          />
-                          <span className="form-check-label">{s.name}</span>
-                        </label>
-                      ))}
                       <p className="text-secondary">
                         An invitation email lets the person set their password.
                       </p>
                     </div>
                   </div>
-                  <button disabled={busy} className="btn btn-primary">
+                  <button
+                    disabled={busy}
+                    className="btn btn-primary"
+                  >
                     Create & invite
                   </button>
                 </form>
@@ -689,7 +737,7 @@ function App() {
                             {
                               method: "POST",
                               body: JSON.stringify({
-                                operationId: crypto.randomUUID(),
+                                operationId: operationId(),
                               }),
                             },
                           );
@@ -726,7 +774,7 @@ function App() {
                             {
                               method: "POST",
                               body: JSON.stringify({
-                                operationId: crypto.randomUUID(),
+                                operationId: operationId(),
                               }),
                             },
                           );
@@ -768,17 +816,16 @@ function App() {
                 className="card card-body mb-4"
                 onSubmit={(e) => {
                   e.preventDefault();
-                  const b = Object.fromEntries(new FormData(e.target));
-                  b.latitude = Number(b.latitude);
-                  b.longitude = Number(b.longitude);
-                  b.operationId = crypto.randomUUID();
+                  const form = e.currentTarget;
+                  const b = Object.fromEntries(new FormData(form));
+                  b.operationId = operationId();
                   task(async () => {
                     await api("/manager/shops", {
                       method: "POST",
                       body: JSON.stringify(b),
                     });
-                    e.target.reset();
-                    setNotice("Shop created");
+                    form.reset();
+                    setNotice("Shop created; location resolved from address.");
                     setRefresh((x) => x + 1);
                   });
                 }}
@@ -788,11 +835,13 @@ function App() {
                   <div className="col-md-6">
                     {field("shopId", "Four digit ID (0001–0099)")}
                     {field("name", "Shop name")}
-                    {field("address", "Address")}
+                    {field("address", "Full address (street, city, country)")}
+                    <p className="text-secondary">
+                      Coordinates are looked up automatically when you create the shop.
+                      Address lookup uses Photon / <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a>.
+                    </p>
                   </div>
                   <div className="col-md-6">
-                    {field("latitude", "Latitude", "number")}
-                    {field("longitude", "Longitude", "number")}
                     {field(
                       "password",
                       "Shop password (12+ characters)",
@@ -804,7 +853,7 @@ function App() {
                   disabled={busy}
                   className="btn btn-primary align-self-start"
                 >
-                  Create shop
+                  {busy ? "Creating shop…" : "Create shop"}
                 </button>
               </form>
               <Table
@@ -842,20 +891,20 @@ function App() {
                   r.status,
                 ])}
               />
-              <form className="mt-4" onSubmit={correct}>
+              {history.record.effective_deleted ? <p className="mt-4 text-secondary">Status: removal. Original data and history are retained; time adjustment is unavailable.</p> : <form className="mt-4" onSubmit={correct}>
                 {field(
                   "occurredAt",
                   "New time (Pacific/Auckland)",
                   "datetime-local",
                 )}
                 <button disabled={busy} className="btn btn-primary">
-                  Confirm time adjustment
+                  Submit adjustment
                 </button>
                 <p className="text-secondary mt-2">
-                  The original record remains unchanged. Reject a pending
-                  adjustment before making a manual correction.
+                  Changes require manager approval before affecting confirmed attendance.
+                  Resolve an existing pending adjustment before submitting another.
                 </p>
-              </form>
+              </form>}
             </div>
           </section>
         </div>

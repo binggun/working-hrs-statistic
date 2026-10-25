@@ -4,3 +4,5 @@ node_modules/
 !.env.example
 web/dist/
 coverage/
+
+server/data/

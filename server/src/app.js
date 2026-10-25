@@ -1,4 +1,7 @@
 import express from "express";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import multer from "multer";
 import sharp from "sharp";
 import {
@@ -22,6 +25,7 @@ import { z } from "zod";
 import { DateTime } from "luxon";
 import PDFDocument from "pdfkit";
 import { pool, transaction } from "./db.js";
+import { geocodeAddress } from "./geocode.js";
 import { monthBounds, localDate, zone } from "./domain.js";
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -51,46 +55,39 @@ app.post(
   ["/api/v1/auth/login", "/api/v1/manager/auth/login"],
   rateLimit({ windowMs: 900000, limit: 30 }),
   async (req, res) => {
-    const b = z
-      .object({
-        password: z.string().min(1),
-        email: z.email().optional(),
-        accountId: z
-          .string()
-          .regex(/^\d{4}$/)
-          .optional(),
-      })
-      .parse(req.body);
+    const b = z.object({
+      password: z.string().min(1), email: z.email().optional(),
+      accountId: z.string().regex(/^\d{4}$/).optional(),
+    }).refine((body) => !!body.email !== !!body.accountId).parse(req.body);
     const manager = req.path.includes("/manager/");
-    const r = await pool.query(
+    const data = await transaction(async (c) => {
+    const r = await c.query(
       manager
-        ? "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('MANAGER','SUPER_MANAGER')"
-        : "SELECT * FROM accounts WHERE login_code=$1 AND role IN('SHOP','WORKER')",
-      [manager ? b.email?.toLowerCase() : b.accountId],
+        ? "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('MANAGER','SUPER_MANAGER') ORDER BY id FOR SHARE"
+        : b.email
+          ? "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('WORKER','MANAGER','SUPER_MANAGER') ORDER BY id FOR SHARE"
+          : "SELECT * FROM accounts WHERE login_code=$1 AND role IN('SHOP','WORKER') FOR SHARE",
+      [b.email?.toLowerCase() || b.accountId],
     );
-    const a = r.rows[0];
-    if (
-      !a ||
-      a.status !== "ACTIVE" ||
-      !a.password_hash ||
-      !(await argon2.verify(a.password_hash, b.password))
-    )
-      fail(401, "Invalid credentials", "INVALID_CREDENTIALS");
+    const matches = [];
+    for (const account of r.rows) {
+      if (account.status === "ACTIVE" && account.password_hash && await argon2.verify(account.password_hash, b.password))
+        matches.push(account);
+    }
+    if (!matches.length) fail(401, "Invalid credentials", "INVALID_CREDENTIALS");
+    if (matches.length > 1) fail(422, "Multiple accounts match. Use your four-digit employee ID or contact an administrator.", "AMBIGUOUS_ACCOUNT");
+    const a = matches[0];
     const t = token();
     const expiry = new Date(
       Date.now() + Number(process.env.SESSION_HOURS || 12) * 3600000,
     );
-    await pool.query(
+    await c.query(
       "INSERT INTO sessions(account_id,token_hash,expires_at) VALUES($1,$2,$3)",
       [a.id, hash(t), expiry],
     );
-    res.json({
-      data: {
-        sessionToken: t,
-        expiresAt: expiry,
-        account: { id: a.id, role: a.role, name: a.name },
-      },
+    return { sessionToken: t, expiresAt: expiry, account: await accountInfo(a, c) };
     });
+    res.json({ data });
   },
 );
 app.post("/api/v1/auth/password-links/consume", async (req, res) => {
@@ -150,15 +147,13 @@ app.post(
       .refine((b) => !!b.accountId !== !!b.email)
       .parse(req.body);
     await transaction(async (c) => {
-      const a = (
-        await c.query(
-          b.accountId
-            ? "SELECT * FROM accounts WHERE login_code=$1 AND role='WORKER' AND status='ACTIVE' FOR UPDATE"
-            : "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('MANAGER','SUPER_MANAGER') AND status='ACTIVE' FOR UPDATE",
-          [b.accountId || b.email.toLowerCase()],
-        )
-      ).rows[0];
-      if (a) await invite(c, a, "PASSWORD_RESET");
+      const matches = (await c.query(
+        b.accountId
+          ? "SELECT * FROM accounts WHERE login_code=$1 AND role='WORKER' AND status='ACTIVE' ORDER BY id FOR UPDATE"
+          : "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('WORKER','MANAGER','SUPER_MANAGER') AND status='ACTIVE' ORDER BY id FOR UPDATE",
+        [b.accountId || b.email.toLowerCase()],
+      )).rows;
+      for (const account of matches) await invite(c, account, "PASSWORD_RESET");
     });
     res.json({ data: { accepted: true } });
   },
@@ -185,15 +180,82 @@ app.post("/api/v1/auth/logout", async (req, res) => {
   ]);
   res.json({ data: { loggedOut: true } });
 });
-app.get("/api/v1/me", (req, res) =>
-  res.json({
-    data: {
-      id: req.account.id,
-      role: req.account.role,
-      name: req.account.name,
-    },
-  }),
+app.post("/api/v1/me/password", rateLimit({ windowMs: 900000, limit: 10 }), async (req, res) => {
+  const body = z.object({ currentPassword: z.string().min(1).max(1024), newPassword: z.string().min(12).max(128) }).strict().parse(req.body);
+  await transaction(async (c) => {
+    const account = (await c.query("SELECT * FROM accounts WHERE id=$1 FOR UPDATE", [req.account.id])).rows[0];
+    if (!account.password_hash || !await argon2.verify(account.password_hash, body.currentPassword))
+      fail(422, "Current password is incorrect", "CURRENT_PASSWORD_INCORRECT");
+    if (body.currentPassword === body.newPassword) fail(422, "Choose a different password", "PASSWORD_UNCHANGED");
+    await c.query("UPDATE accounts SET password_hash=$1 WHERE id=$2", [await argon2.hash(body.newPassword), req.account.id]);
+    await c.query("UPDATE sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL", [req.account.id]);
+    await c.query("UPDATE password_links SET revoked_at=now() WHERE account_id=$1 AND used_at IS NULL AND revoked_at IS NULL", [req.account.id]);
+    await audit(c, req.account, "PASSWORD_CHANGE", req.account.id);
+  });
+  res.json({ data: { changed: true, requiresLogin: true } });
+});
+async function accountInfo(account, c = pool) {
+  const preferred = account.preferred_shop_id ? (await c.query(
+    "SELECT sa.login_code FROM shops s JOIN accounts sa ON sa.id=s.account_id WHERE s.id=$1",
+    [account.preferred_shop_id],
+  )).rows[0]?.login_code : null;
+  return { id: account.id, accountId: account.login_code || null, role: account.role, name: account.name, preferredShopId: preferred || null };
+}
+app.get("/api/v1/me", async (req, res) =>
+  res.json({ data: await accountInfo(req.account) }),
 );
+app.post("/api/v1/me/preferences", async (req, res) => {
+  const body = z.object({ preferredShopId: z.string().regex(/^\d{4}$/).nullable() }).parse(req.body);
+  const data = await transaction(async (c) => {
+    let shop = null;
+    if (body.preferredShopId !== null) {
+      shop = (await c.query(
+        "SELECT s.id FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1",
+        [body.preferredShopId],
+      )).rows[0];
+      if (!shop) fail(422, "Unknown preferred shop");
+      if (req.account.role !== "WORKER") await assertShop(c, req.account, shop.id);
+    }
+    await c.query("UPDATE accounts SET preferred_shop_id=$1,profile_version=profile_version+1 WHERE id=$2", [shop?.id || null, req.account.id]);
+    return { preferredShopId: body.preferredShopId };
+  });
+  res.json({ data });
+});
+async function profileInfo(account, c = pool) {
+  return { ...await accountInfo(account, c), email: account.email || "", firstName: account.first_name || account.name,
+    lastName: account.last_name || "", address: account.profile_address, phone: account.profile_phone,
+    version: account.profile_version };
+}
+app.get("/api/v1/me/profile", async (req, res) => res.json({ data: await profileInfo(req.account) }));
+app.post("/api/v1/me/profile", async (req, res) => {
+  const body = z.object({
+    operationId: uuid, expectedVersion: z.number().int().positive(),
+    firstName: z.string().trim().min(1).max(100), lastName: z.string().trim().max(100),
+    address: z.string().trim().max(500), phone: z.string().trim().max(50),
+    preferredShopId: z.string().regex(/^\d{4}$/).nullable(),
+  }).strict().parse(req.body);
+  const data = await transaction((c) => idem(c, req.account, body, "PROFILE", async () => {
+    const previous = (await c.query("SELECT * FROM accounts WHERE id=$1 FOR UPDATE", [req.account.id])).rows[0];
+    if (previous.profile_version !== body.expectedVersion) fail(409, "Profile changed; reload before saving", "PROFILE_CHANGED");
+    let preferred = null;
+    if (body.preferredShopId !== null) {
+      preferred = (await c.query("SELECT s.id FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1", [body.preferredShopId])).rows[0];
+      if (!preferred) fail(422, "Unknown preferred shop");
+      if (req.account.role !== "WORKER") await assertShop(c, req.account, preferred.id);
+    }
+    const name = [body.firstName, body.lastName].filter(Boolean).join(" ");
+    const updated = (await c.query(
+      "UPDATE accounts SET first_name=$1,last_name=$2,profile_address=$3,profile_phone=$4,name=$5,preferred_shop_id=$6,profile_version=profile_version+1 WHERE id=$7 RETURNING *",
+      [body.firstName, body.lastName, body.address, body.phone, name, preferred?.id || null, req.account.id],
+    )).rows[0];
+    await c.query("UPDATE workers SET address=$1,contact=$2 WHERE account_id=$3", [body.address, body.phone, req.account.id]);
+    await audit(c, req.account, "PROFILE_UPDATE", req.account.id,
+      { firstName: previous.first_name, lastName: previous.last_name, address: previous.profile_address, phone: previous.profile_phone, preferredShopId: previous.preferred_shop_id },
+      { firstName: body.firstName, lastName: body.lastName, address: body.address, phone: body.phone, preferredShopId: preferred?.id || null });
+    return profileInfo(updated, c);
+  }));
+  res.json({ data });
+});
 function manager(req, res, next) {
   if (!backend.includes(req.account.role))
     return next(
@@ -288,9 +350,9 @@ app.post("/api/v1/manager/shops", async (req, res) => {
         .regex(/^00\d{2}$/)
         .refine((x) => x !== "0000"),
       name: z.string().trim().min(1),
-      address: z.string().min(1),
-      latitude: z.number().min(-90).max(90),
-      longitude: z.number().min(-180).max(180),
+      address: z.string().trim().min(1).max(500),
+      latitude: z.number().min(-90).max(90).optional(),
+      longitude: z.number().min(-180).max(180).optional(),
       password: z.string().min(12).max(128),
     })
     .parse(req.body);
@@ -298,6 +360,9 @@ app.post("/api/v1/manager/shops", async (req, res) => {
   const safe = { ...b, password: hash(b.password) };
   const data = await transaction((c) =>
     idem(c, req.account, safe, "SHOP_CREATE", async () => {
+      const coordinates = b.latitude !== undefined && b.longitude !== undefined
+        ? { latitude: b.latitude, longitude: b.longitude }
+        : await geocodeAddress(b.address);
       const a = (
         await c.query(
           "INSERT INTO accounts(role,login_code,name,password_hash,status) VALUES('SHOP',$1,$2,$3,'ACTIVE') RETURNING id",
@@ -307,7 +372,7 @@ app.post("/api/v1/manager/shops", async (req, res) => {
       const s = (
         await c.query(
           "INSERT INTO shops(account_id,name,address,latitude,longitude) VALUES($1,$2,$3,$4,$5) RETURNING *",
-          [a.id, b.name, b.address, b.latitude, b.longitude],
+          [a.id, b.name, b.address, coordinates.latitude, coordinates.longitude],
         )
       ).rows[0];
       await audit(c, req.account, "SHOP_CREATE", s.id);
@@ -318,8 +383,7 @@ app.post("/api/v1/manager/shops", async (req, res) => {
 });
 app.get("/api/v1/manager/workers", async (req, res) => {
   const r = await pool.query(
-    `SELECT w.id,a.id AS "accountId",a.login_code AS "workerId",a.name,a.email,a.status FROM workers w JOIN accounts a ON a.id=w.account_id WHERE $1='SUPER_MANAGER' OR EXISTS(SELECT 1 FROM account_shops ws JOIN account_shops ms ON ms.shop_id=ws.shop_id WHERE ws.account_id=a.id AND ms.account_id=$2) ORDER BY a.name`,
-    [req.account.role, req.account.id],
+    `SELECT w.id,a.id AS "accountId",a.login_code AS "workerId",a.name,a.email,a.status FROM workers w JOIN accounts a ON a.id=w.account_id ORDER BY a.name`,
   );
   res.json({ data: r.rows });
 });
@@ -382,7 +446,7 @@ app.post(
         operationId: uuid,
         name: z.string().trim().min(1),
         email: z.email(),
-        shopIds: z.array(z.string().regex(/^00\d{2}$/)).min(1),
+        shopIds: z.array(z.string().regex(/^00\d{2}$/)).default([]),
         contact: z.string().optional(),
         address: z.string().optional(),
       })
@@ -390,7 +454,7 @@ app.post(
     const data = await transaction((c) =>
       idem(c, req.account, b, "ACCOUNT_CREATE", async () => {
         const shops = [];
-        for (const code of [...new Set(b.shopIds)]) {
+        for (const code of isManager ? [...new Set(b.shopIds)] : []) {
           const s = (
             await c.query(
               "SELECT s.id FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1",
@@ -467,13 +531,6 @@ app.post("/api/v1/manager/accounts/:id/invitations", async (req, res) => {
           fail(422, "Only pending accounts can be invited");
         if (req.account.role !== "SUPER_MANAGER") {
           if (a.role !== "WORKER") fail(403, "Owner required");
-          const permitted = (
-            await c.query(
-              "SELECT 1 FROM account_shops w JOIN account_shops m ON m.shop_id=w.shop_id WHERE w.account_id=$1 AND m.account_id=$2",
-              [a.id, req.account.id],
-            )
-          ).rowCount;
-          if (!permitted) fail(403, "Account outside scope");
         }
         const invitationId = await invite(c, a);
         await audit(c, req.account, "INVITATION_RESEND", a.id);
@@ -485,8 +542,8 @@ app.post("/api/v1/manager/accounts/:id/invitations", async (req, res) => {
 });
 app.get("/api/v1/manager/invitations", async (req, res) => {
   const r = await pool.query(
-    `SELECT e.id,e.account_id AS "accountId",a.name,e.status,e.last_error_code,e.created_at,p.expires_at,p.used_at FROM email_jobs e JOIN accounts a ON a.id=e.account_id JOIN password_links p ON p.id=e.password_link_id WHERE $1='SUPER_MANAGER' OR (a.role='WORKER' AND EXISTS(SELECT 1 FROM account_shops w JOIN account_shops m ON m.shop_id=w.shop_id WHERE w.account_id=a.id AND m.account_id=$2)) ORDER BY e.created_at DESC LIMIT 100`,
-    [req.account.role, req.account.id],
+    `SELECT e.id,e.account_id AS "accountId",a.name,e.status,e.last_error_code,e.created_at,p.expires_at,p.used_at FROM email_jobs e JOIN accounts a ON a.id=e.account_id JOIN password_links p ON p.id=e.password_link_id WHERE $1='SUPER_MANAGER' OR a.role='WORKER' ORDER BY e.created_at DESC LIMIT 100`,
+    [req.account.role],
   );
   res.json({ data: r.rows });
 });
@@ -578,7 +635,7 @@ async function records(req, c = pool) {
   const f = filters(req);
   return (
     await c.query(
-      `SELECT r.*,wa.name AS worker_name,wa.login_code AS "workerId",s.name AS shop_name,sa.login_code AS "shopId",EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending ${filtered} ORDER BY r.effective_occurred_at,r.id`,
+      `SELECT r.*,wa.name AS worker_name,wa.login_code AS "workerId",s.name AS shop_name,sa.login_code AS "shopId",EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending ${filtered} AND ($1='SUPER_MANAGER' OR NOT r.effective_deleted) ORDER BY r.effective_occurred_at,r.id`,
       f,
     )
   ).rows;
@@ -736,66 +793,9 @@ app.post("/api/v1/manager/attendance/:id/corrections", async (req, res) => {
       occurredAt: instant,
     })
     .parse(req.body);
-  const data = await transaction((c) =>
-    idem(
-      c,
-      req.account,
-      { ...b, recordId: req.params.id },
-      "CORRECTION",
-      async () => {
-        const r = (
-          await c.query(
-            "SELECT * FROM attendance_records WHERE id=$1 FOR UPDATE",
-            [req.params.id],
-          )
-        ).rows[0];
-        if (!r) fail(404, "Missing record");
-        await assertShop(c, req.account, r.shop_id);
-        if (r.version !== b.expectedRecordVersion)
-          fail(409, "Record changed; reload");
-        if (
-          (
-            await c.query(
-              "SELECT 1 FROM attendance_adjustments WHERE record_id=$1 AND status='PENDING'",
-              [r.id],
-            )
-          ).rowCount
-        )
-          fail(409, "Resolve pending adjustment before manual correction");
-        const j = (
-          await c.query(
-            "INSERT INTO attendance_adjustments(record_id,actor_account_id,source,action,before_at,after_at,status,base_version) VALUES($1,$2,'MANAGER_EDIT','UPDATE',$3,$4,'APPROVED',$5) RETURNING id",
-            [
-              r.id,
-              req.account.id,
-              r.effective_occurred_at,
-              b.occurredAt,
-              r.version,
-            ],
-          )
-        ).rows[0];
-        await c.query(
-          "INSERT INTO attendance_validations(adjustment_id,validated_by_account_id,decision,previous_confirmed_at,resulting_confirmed_at) VALUES($1,$2,'APPROVE',$3,$4)",
-          [j.id, req.account.id, r.confirmed_occurred_at, b.occurredAt],
-        );
-        await c.query(
-          "UPDATE attendance_records SET confirmed_occurred_at=$1,effective_occurred_at=$1,version=version+1 WHERE id=$2",
-          [b.occurredAt, r.id],
-        );
-        await rebuild(c, r.worker_id);
-        await audit(
-          c,
-          req.account,
-          "TIME_CORRECTION",
-          r.id,
-          { time: r.confirmed_occurred_at },
-          { time: b.occurredAt },
-        );
-        return { recordId: r.id, version: r.version + 1 };
-      },
-    ),
-  );
-  res.json({ data });
+  req.body = { operationId: b.operationId, action: "UPDATE", recordId: req.params.id,
+    expectedVersion: b.expectedRecordVersion, occurredAt: b.occurredAt };
+  return attendanceAdjustment(req, res);
 });
 app.post("/api/v1/attendance", async (req, res) => {
   if (!["SHOP", "WORKER"].includes(req.account.role))
@@ -808,6 +808,7 @@ app.post("/api/v1/attendance", async (req, res) => {
       type: z.enum(["SIGN_IN", "SIGN_OUT"]),
       occurredAt: instant,
       plannedStartAt: instant.optional(),
+      expectedDailyCount: z.number().int().nonnegative().optional(),
       offline: z.boolean(),
       cameraStatus: z.enum(["AVAILABLE", "UNAVAILABLE"]),
       photoId: uuid.optional(),
@@ -816,6 +817,8 @@ app.post("/api/v1/attendance", async (req, res) => {
           status: z.enum(["AVAILABLE", "UNAVAILABLE"]),
           latitude: z.number().min(-90).max(90).optional(),
           longitude: z.number().min(-180).max(180).optional(),
+          accuracyMeters: z.number().nonnegative().max(100000).optional(),
+          capturedAt: instant.optional(),
         })
         .optional(),
     })
@@ -839,6 +842,13 @@ app.post("/api/v1/attendance", async (req, res) => {
         if (w.account_id !== req.account.id)
           fail(403, "Cannot sign for another worker");
       } else await assertShop(c, req.account, s.id);
+      if (b.expectedDailyCount !== undefined) {
+        const day = localDate(b.occurredAt);
+        const count = await dailyAttendanceCount(c, w.id, s.id, day);
+        if (day !== localDate(new Date()) || count !== b.expectedDailyCount ||
+            b.type !== (count % 2 === 0 ? "SIGN_IN" : "SIGN_OUT"))
+          fail(409, "Attendance changed; refresh today's status", "ATTENDANCE_CHANGED");
+      }
       if (b.cameraStatus === "AVAILABLE") {
         if (!b.photoId) fail(422, "Photo required");
         const photo = (
@@ -928,6 +938,8 @@ app.post("/api/v1/attendance", async (req, res) => {
       await rebuild(c, w.id);
       return {
         recordId: r.id,
+        shopId: b.shopId, shopName: s.name, occurredAt: r.original_occurred_at, type: r.sign_type,
+        dailyCount: await dailyAttendanceCount(c, w.id, s.id, day),
         syncStatus: "SYNCED",
         validationStatus: late ? "PENDING" : "CONFIRMED",
       };
@@ -975,7 +987,7 @@ app.post("/api/v1/manager/reports/pdf", async (req, res) => {
   res.type("pdf");
   res.setHeader(
     "Content-Disposition",
-    `attachment; filename="pawhub-${b.month}.pdf"`,
+    `attachment; filename="Pawhub-${b.month}.pdf"`,
   );
   const doc = new PDFDocument({ margin: 40 });
   doc.pipe(res);
@@ -1019,6 +1031,12 @@ async function appScope(req, c, shopCode, workerCode) {
   else fail(403, "App account required");
   return { w, s };
 }
+async function dailyAttendanceCount(c, workerId, shopId, day) {
+  return Number((await c.query(
+    "SELECT count(*)::int AS count FROM attendance_records WHERE worker_id=$1 AND shop_id=$2 AND NOT effective_deleted AND (effective_occurred_at AT TIME ZONE $3)::date=$4::date",
+    [workerId, shopId, zone, day],
+  )).rows[0].count);
+}
 app.get("/api/v1/attendance/status", async (req, res) => {
   const code = req.query.workerId || req.account.login_code;
   const { w, s } = await appScope(req, pool, req.query.shopId, code);
@@ -1035,12 +1053,14 @@ app.get("/api/v1/attendance/status", async (req, res) => {
       [w.id, zone, day],
     )
   ).rowCount;
+  const count = await dailyAttendanceCount(pool, w.id, s.id, day);
   res.json({
     data: {
       localDate: day,
       timezone: zone,
       serverTime: new Date().toISOString(),
-      nextAction: r?.sign_type === "SIGN_IN" ? "SIGN_OUT" : "SIGN_IN",
+      dailyCount: count,
+      nextAction: count % 2 === 0 ? "SIGN_IN" : "SIGN_OUT",
       requiresPlannedStart: !any,
       latestRecordId: r?.id || null,
     },
@@ -1062,7 +1082,7 @@ app.get("/api/v1/attendance", async (req, res) => {
   )
     fail(422, "Date range must be within 31 days");
   const r = await pool.query(
-    "SELECT * FROM attendance_records WHERE worker_id=$1 AND shop_id=$2 AND (effective_occurred_at AT TIME ZONE $3)::date BETWEEN $4::date AND $5::date ORDER BY effective_occurred_at,id",
+    "SELECT r.*,EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending FROM attendance_records r WHERE worker_id=$1 AND shop_id=$2 AND NOT effective_deleted AND (effective_occurred_at AT TIME ZONE $3)::date BETWEEN $4::date AND $5::date ORDER BY effective_occurred_at,id",
     [w.id, s.id, zone, range.fromDate, range.toDate],
   );
   res.json({ data: { items: r.rows } });
@@ -1083,7 +1103,8 @@ app.get("/api/v1/attendance/summary", async (req, res) => {
   );
   res.json({ data: { segments: r.rows } });
 });
-app.post("/api/v1/attendance-adjustments", async (req, res) => {
+async function attendanceAdjustment(req, res) {
+  const managerRequest = req.path.includes("/manager/");
   const b = z
     .object({
       operationId: uuid,
@@ -1101,12 +1122,13 @@ app.post("/api/v1/attendance-adjustments", async (req, res) => {
       let r;
       if (b.action === "ADD") {
         if (!b.occurredAt || !b.type) fail(422, "Time and type required");
-        const { w, s } = await appScope(
-          req,
-          c,
-          b.shopId,
-          b.workerId || req.account.login_code,
-        );
+        let w, s;
+        if (managerRequest) {
+          w = (await c.query("SELECT w.* FROM workers w JOIN accounts a ON a.id=w.account_id WHERE a.login_code=$1 AND a.status='ACTIVE'", [b.workerId])).rows[0];
+          s = (await c.query("SELECT s.* FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1", [b.shopId])).rows[0];
+          if (!w || !s) fail(422, "Active employee and store required");
+          await assertShop(c, req.account, s.id);
+        } else ({ w, s } = await appScope(req, c, b.shopId, b.workerId || req.account.login_code));
         await c.query("SELECT id FROM workers WHERE id=$1 FOR UPDATE", [w.id]);
         r = (
           await c.query(
@@ -1124,7 +1146,9 @@ app.post("/api/v1/attendance-adjustments", async (req, res) => {
           )
         ).rows[0];
         if (!r) fail(404, "Record missing");
-        await appScope(req, c, r.shop_code, r.worker_code);
+        if (managerRequest) await assertShop(c, req.account, r.shop_id);
+        else await appScope(req, c, r.shop_code, r.worker_code);
+        if (r.effective_deleted) fail(409, "Record is already marked for removal");
         if (r.version !== b.expectedVersion) fail(409, "Record changed");
         if (b.action === "UPDATE" && !b.occurredAt) fail(422, "Time required");
       }
@@ -1140,10 +1164,11 @@ app.post("/api/v1/attendance-adjustments", async (req, res) => {
       const after = b.action === "DELETE" ? null : b.occurredAt;
       const j = (
         await c.query(
-          "INSERT INTO attendance_adjustments(record_id,actor_account_id,source,action,before_at,after_at,base_version) VALUES($1,$2,'WORKER_EDIT',$3,$4,$5,$6) RETURNING id",
+          "INSERT INTO attendance_adjustments(record_id,actor_account_id,source,action,before_at,after_at,base_version) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
           [
             r.id,
             req.account.id,
+            managerRequest ? "MANAGER_EDIT" : "WORKER_EDIT",
             b.action,
             b.action === "ADD" ? null : r.effective_occurred_at,
             after,
@@ -1156,19 +1181,22 @@ app.post("/api/v1/attendance-adjustments", async (req, res) => {
         [after, b.action === "DELETE", r.id],
       );
       await rebuild(c, r.worker_id);
+      await audit(c, req.account, "ATTENDANCE_" + (b.action === "DELETE" ? "REMOVAL" : b.action) + "_REQUEST", r.id);
       return {
         recordId: r.id,
+        recordStatus: b.action === "DELETE" ? "removal" : "active",
         adjustmentId: j.id,
         validationStatus: "PENDING",
       };
     }),
   );
-  res.status(201).json({ data });
-});
+  res.status(req.path.endsWith("/corrections") ? 200 : 201).json({ data });
+}
+app.post(["/api/v1/attendance-adjustments", "/api/v1/manager/attendance-adjustments"], attendanceAdjustment);
 app.post("/api/v1/photos", upload.single("file"), async (req, res) => {
   if (!["SHOP", "WORKER"].includes(req.account.role))
     fail(403, "App account required");
-  if (!process.env.PHOTO_BUCKET) fail(503, "Photo storage not configured");
+  if (process.env.PHOTO_STORAGE !== "local" && !process.env.PHOTO_BUCKET) fail(503, "Photo storage not configured");
   const operationId = uuid.parse(req.body.operationId);
   if (!req.file) fail(422, "Photo required");
   const meta = await sharp(req.file.buffer, {
@@ -1182,25 +1210,31 @@ app.post("/api/v1/photos", upload.single("file"), async (req, res) => {
     idem(c, req.account, b, "PHOTO", async () => {
       const id = randomUUID(),
         key = `photos/${req.account.id}/${operationId}.${meta.format}`;
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: process.env.PHOTO_BUCKET,
-          Key: key,
-          Body: req.file.buffer,
-          ContentType: "image/" + meta.format,
-          ServerSideEncryption: "AES256",
-        }),
-      );
+      const storageKey = process.env.PHOTO_STORAGE === "local" ? `local:${key}` : key;
+      if (process.env.PHOTO_STORAGE === "local") {
+        const file = localPhotoPath(storageKey);
+        await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+        await writeFile(file, req.file.buffer, { mode: 0o600 });
+      } else {
+        await s3.send(new PutObjectCommand({ Bucket: process.env.PHOTO_BUCKET, Key: key,
+          Body: req.file.buffer, ContentType: "image/" + meta.format, ServerSideEncryption: "AES256" }));
+      }
       await c.query(
         "INSERT INTO photos(id,uploaded_by_account_id,storage_key,status,media_type,byte_size) VALUES($1,$2,$3,'READY',$4,$5)",
-        [id, req.account.id, key, meta.format, req.file.size],
+        [id, req.account.id, storageKey, meta.format, req.file.size],
       );
       return { photoId: id };
     }),
   );
   res.status(201).json({ data });
 });
-app.get("/api/v1/photos/:id", async (req, res) => {
+function localPhotoPath(key) {
+  if (!/^local:photos\/[a-f0-9-]{36}\/[a-f0-9-]{36}\.(jpeg|png|webp)$/.test(key))
+    fail(422, "Invalid photo storage key");
+  const directory = process.env.PHOTO_LOCAL_DIR || fileURLToPath(new URL("../data/photos/", import.meta.url));
+  return path.resolve(directory, key.slice("local:photos/".length));
+}
+async function readablePhoto(req) {
   uuid.parse(req.params.id);
   const r = (
     await pool.query(
@@ -1215,6 +1249,20 @@ app.get("/api/v1/photos/:id", async (req, res) => {
     } else await assertShop(pool, req.account, r.shop_id);
   } else if (r.uploaded_by_account_id !== req.account.id)
     fail(403, "Forbidden");
+  return r;
+}
+app.get("/api/v1/photos/:id/file", async (req, res) => {
+  const photo = await readablePhoto(req);
+  if (!photo.storage_key.startsWith("local:")) fail(404, "Local photo unavailable");
+  res.set("Cache-Control", "private, no-store");
+  res.type(photo.media_type === "jpeg" ? "image/jpeg" : `image/${photo.media_type}`);
+  res.sendFile(localPhotoPath(photo.storage_key));
+});
+app.get("/api/v1/photos/:id", async (req, res) => {
+  const r = await readablePhoto(req);
+  if (r.storage_key.startsWith("local:")) return res.json({ data: {
+    url: `/api/v1/photos/${r.id}/file`, requiresAuthentication: true,
+  } });
   res.json({
     data: {
       url: await getSignedUrl(

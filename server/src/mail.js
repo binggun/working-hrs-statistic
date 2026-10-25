@@ -1,8 +1,9 @@
-import { SESv2Client, SendEmailCommand } from "@aws-sdk/client-sesv2";
+import nodemailer from "nodemailer";
 import { createDecipheriv } from "node:crypto";
 import { pool, transaction } from "./db.js";
 export async function processMail() {
   if (
+    !process.env.SMTP_HOST ||
     !process.env.MAIL_FROM ||
     !process.env.WEB_ORIGIN ||
     !process.env.MAIL_ENCRYPTION_KEY
@@ -52,24 +53,30 @@ export async function processMail() {
     );
     const url = new URL(process.env.WEB_ORIGIN);
     url.hash = "activate=" + payload.token;
-    await new SESv2Client({
-      region: process.env.AWS_REGION || "ap-southeast-2",
-    }).send(
-      new SendEmailCommand({
-        FromEmailAddress: process.env.MAIL_FROM,
-        Destination: { ToAddresses: [job.recipient_email] },
-        Content: {
-          Simple: {
-            Subject: { Data: "Pawhub account invitation" },
-            Body: {
-              Text: {
-                Data: `Hello ${payload.name},\nSet your password: ${url}\nThis link expires in seven days and can be used once.`,
-              },
-            },
-          },
-        },
-      }),
-    );
+    const port = Number(process.env.SMTP_PORT || 587);
+    const secure = process.env.SMTP_SECURE === "true" ||
+      (process.env.SMTP_SECURE === undefined && port === 465);
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port,
+      secure,
+      requireTLS: !secure,
+      auth: process.env.SMTP_USER ? {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      } : undefined,
+      connectionTimeout: 15000,
+      greetingTimeout: 15000,
+      socketTimeout: 30000,
+    });
+    await transporter.sendMail({
+      from: process.env.MAIL_FROM,
+      to: job.recipient_email,
+      subject: "Pawhub account invitation",
+      text: `Hello ${payload.name},\nSet your password: ${url}\nThis link expires in seven days and can be used once.`,
+      disableFileAccess: true,
+      disableUrlAccess: true,
+    });
     await pool.query(
       "UPDATE email_jobs SET status='SENT',sent_at=now(),encrypted_payload=NULL WHERE id=$1",
       [job.id],
@@ -77,7 +84,7 @@ export async function processMail() {
   } catch (e) {
     await pool.query(
       "UPDATE email_jobs SET status=$2,last_error_code=$3,next_attempt_at=now()+interval '5 minutes',encrypted_payload=CASE WHEN $2='FAILED' THEN NULL ELSE encrypted_payload END WHERE id=$1",
-      [job.id, job.attempt_count >= 4 ? "FAILED" : "QUEUED", e.name],
+      [job.id, job.attempt_count >= 4 ? "FAILED" : "QUEUED", e.code || e.name],
     );
   }
 }
