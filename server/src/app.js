@@ -1,7 +1,10 @@
+import { attendanceLocation } from "./attendance-location.js";
+import { dailyAttendanceHours, totalAttendanceHours } from "./attendance-hours.js";
 import express from "express";
+import { mountOrganization } from "./organization.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { localPhotoPath } from "./photo-storage.js";
 import multer from "multer";
 import sharp from "sharp";
 import {
@@ -38,7 +41,8 @@ if (process.env.TRUST_PROXY === "1") app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: process.env.WEB_ORIGIN || "http://localhost:5173" }));
 app.use(express.json({ limit: "256kb" }));
-app.use(rateLimit({ windowMs: 60000, limit: 300 }));
+export const apiLimiter = rateLimit({ windowMs: 60000, limit: 300 });
+app.use(apiLimiter);
 const hash = (x) => createHash("sha256").update(x).digest("hex");
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message, code = "REQUEST_FAILED") => {
@@ -46,7 +50,8 @@ const fail = (status, message, code = "REQUEST_FAILED") => {
 };
 const uuid = z.string().uuid();
 const instant = z.iso.datetime({ offset: true });
-const backend = ["MANAGER", "SUPER_MANAGER"];
+const backend = ["MANAGER", "GENERAL_MANAGER", "SUPER_MANAGER"];
+const companyAdmin = account => ["GENERAL_MANAGER", "SUPER_MANAGER"].includes(account.role);
 app.get("/api/v1/health", async (req, res) => {
   await pool.query("SELECT 1");
   res.json({ data: { status: "ok" } });
@@ -63,15 +68,15 @@ app.post(
     const data = await transaction(async (c) => {
     const r = await c.query(
       manager
-        ? "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('MANAGER','SUPER_MANAGER') ORDER BY id FOR SHARE"
+        ? (b.email ? "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('MANAGER','GENERAL_MANAGER','SUPER_MANAGER') ORDER BY id FOR SHARE" : "SELECT * FROM accounts WHERE login_code=$1 AND role IN('MANAGER','GENERAL_MANAGER','SUPER_MANAGER') ORDER BY id FOR SHARE")
         : b.email
-          ? "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('WORKER','MANAGER','SUPER_MANAGER') ORDER BY id FOR SHARE"
-          : "SELECT * FROM accounts WHERE login_code=$1 AND role IN('SHOP','WORKER') FOR SHARE",
+          ? "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('WORKER','MANAGER','GENERAL_MANAGER','SUPER_MANAGER') ORDER BY id FOR SHARE"
+          : "SELECT * FROM accounts WHERE login_code=$1 AND role IN('SHOP','WORKER','MANAGER','GENERAL_MANAGER') FOR SHARE",
       [b.email?.toLowerCase() || b.accountId],
     );
     const matches = [];
     for (const account of r.rows) {
-      if (account.status === "ACTIVE" && account.password_hash && await argon2.verify(account.password_hash, b.password))
+      if ((account.status === "ACTIVE" || (!manager && account.role === "WORKER" && account.status === "PENDING" && account.requires_manager_approval)) && account.password_hash && await argon2.verify(account.password_hash, b.password))
         matches.push(account);
     }
     if (!matches.length) fail(401, "Invalid credentials", "INVALID_CREDENTIALS");
@@ -94,13 +99,13 @@ app.post("/api/v1/auth/password-links/consume", async (req, res) => {
   const b = z
     .object({
       token: z.string().min(20),
-      newPassword: z.string().min(12).max(128),
+      newPassword: z.string().min(6).max(128),
     })
     .parse(req.body);
   const pw = await argon2.hash(b.newPassword);
-  await transaction(async (c) => {
+  const data = await transaction(async (c) => {
     const r = await c.query(
-      "SELECT p.*,a.status FROM password_links p JOIN accounts a ON a.id=p.account_id WHERE token_hash=$1 FOR UPDATE OF p,a",
+      "SELECT p.*,a.status,a.requires_manager_approval,a.approved_at FROM password_links p JOIN accounts a ON a.id=p.account_id WHERE token_hash=$1 FOR UPDATE OF p,a",
       [hash(b.token)],
     );
     const p = r.rows[0];
@@ -114,9 +119,10 @@ app.post("/api/v1/auth/password-links/consume", async (req, res) => {
       (p.purpose === "PASSWORD_RESET" && p.status !== "ACTIVE")
     )
       fail(422, "Link invalid or expired", "INVALID_LINK");
+    const awaitingManagerApproval = p.requires_manager_approval && !p.approved_at;
     await c.query(
-      "UPDATE accounts SET password_hash=$1,status='ACTIVE' WHERE id=$2",
-      [pw, p.account_id],
+      "UPDATE accounts SET password_hash=$1,status=$3 WHERE id=$2",
+      [pw, p.account_id, awaitingManagerApproval ? "PENDING" : "ACTIVE"],
     );
     await c.query("UPDATE password_links SET used_at=now() WHERE id=$1", [
       p.id,
@@ -129,8 +135,9 @@ app.post("/api/v1/auth/password-links/consume", async (req, res) => {
       "UPDATE sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL",
       [p.account_id],
     );
+    return { activated: !awaitingManagerApproval, awaitingManagerApproval };
   });
-  res.json({ data: { activated: true } });
+  res.json({ data });
 });
 app.post(
   "/api/v1/auth/password-links",
@@ -140,7 +147,7 @@ app.post(
       .object({
         accountId: z
           .string()
-          .regex(/^[1-9]\d{3}$/)
+          .regex(/^\d{4}$/)
           .optional(),
         email: z.email().optional(),
       })
@@ -149,8 +156,8 @@ app.post(
     await transaction(async (c) => {
       const matches = (await c.query(
         b.accountId
-          ? "SELECT * FROM accounts WHERE login_code=$1 AND role='WORKER' AND status='ACTIVE' ORDER BY id FOR UPDATE"
-          : "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('WORKER','MANAGER','SUPER_MANAGER') AND status='ACTIVE' ORDER BY id FOR UPDATE",
+          ? "SELECT * FROM accounts WHERE login_code=$1 AND role IN('WORKER','MANAGER','GENERAL_MANAGER') AND status='ACTIVE' ORDER BY id FOR UPDATE"
+          : "SELECT * FROM accounts WHERE lower(email)=$1 AND role IN('WORKER','MANAGER','GENERAL_MANAGER','SUPER_MANAGER') AND status='ACTIVE' ORDER BY id FOR UPDATE",
         [b.accountId || b.email.toLowerCase()],
       )).rows;
       for (const account of matches) await invite(c, account, "PASSWORD_RESET");
@@ -158,12 +165,34 @@ app.post(
     res.json({ data: { accepted: true } });
   },
 );
+app.post("/api/v1/auth/register", rateLimit({ windowMs: 900000, limit: 10 }), async (req, res) => {
+  const email = z.email().max(254).transform(v => v.toLowerCase());
+  const b = z.object({ email, confirmEmail: email }).strict()
+    .refine(v => v.email === v.confirmEmail, "Email addresses must match").parse(req.body);
+  await transaction(async c => {
+    // Use the same code-allocation lock as administrator-created employee accounts.
+    await c.query("SELECT pg_advisory_xact_lock(820013)");
+    const matches = (await c.query("SELECT * FROM accounts WHERE lower(email)=$1 ORDER BY id FOR UPDATE", [b.email])).rows;
+    let account = matches.find(a => a.role === "WORKER");
+    if (matches.length && (!account || account.status !== "PENDING")) return;
+    if (!account) {
+      account = (await c.query("INSERT INTO accounts(role,email,name,requires_manager_approval) VALUES('WORKER',$1,$1,true) RETURNING *",
+        [b.email])).rows[0];
+      await c.query("INSERT INTO workers(account_id,contact,address) VALUES($1,'','')", [account.id]);
+      await audit(c, { id: account.id }, "SELF_REGISTRATION", account.id);
+    }
+    const recent = await c.query("SELECT 1 FROM password_links WHERE account_id=$1 AND purpose='FIRST_SETUP' AND used_at IS NULL AND revoked_at IS NULL AND expires_at>now()+interval '6 days 23 hours 55 minutes'", [account.id]);
+    if (!recent.rowCount) await invite(c, account);
+  });
+  // Do not expose whether this address already belongs to an account.
+  res.status(202).json({ data: { accepted: true } });
+});
 app.use("/api/v1", async (req, res, next) => {
   try {
     const t = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
     if (!t) fail(401, "Please sign in");
     const r = await pool.query(
-      "SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now() AND a.status='ACTIVE'",
+      "SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now() AND (a.status='ACTIVE' OR (a.role='WORKER' AND a.status='PENDING' AND a.requires_manager_approval AND a.password_hash IS NOT NULL))",
       [hash(t)],
     );
     if (!r.rowCount) fail(401, "Session expired");
@@ -174,6 +203,12 @@ app.use("/api/v1", async (req, res, next) => {
     next(e);
   }
 });
+app.use(["/api/v1/attendance", "/api/v1/attendance-adjustments", "/api/v1/photos"], (req, res, next) => {
+  if (req.method === "POST" && req.account.role === "WORKER" && req.account.status !== "ACTIVE")
+    return next(Object.assign(new Error("Manager approval is required before recording attendance"),
+      { status: 403, code: "MANAGER_APPROVAL_REQUIRED" }));
+  next();
+});
 app.post("/api/v1/auth/logout", async (req, res) => {
   await pool.query("UPDATE sessions SET revoked_at=now() WHERE token_hash=$1", [
     req.sessionHash,
@@ -181,7 +216,7 @@ app.post("/api/v1/auth/logout", async (req, res) => {
   res.json({ data: { loggedOut: true } });
 });
 app.post("/api/v1/me/password", rateLimit({ windowMs: 900000, limit: 10 }), async (req, res) => {
-  const body = z.object({ currentPassword: z.string().min(1).max(1024), newPassword: z.string().min(12).max(128) }).strict().parse(req.body);
+  const body = z.object({ currentPassword: z.string().min(1).max(1024), newPassword: z.string().min(6).max(128) }).strict().parse(req.body);
   await transaction(async (c) => {
     const account = (await c.query("SELECT * FROM accounts WHERE id=$1 FOR UPDATE", [req.account.id])).rows[0];
     if (!account.password_hash || !await argon2.verify(account.password_hash, body.currentPassword))
@@ -199,7 +234,7 @@ async function accountInfo(account, c = pool) {
     "SELECT sa.login_code FROM shops s JOIN accounts sa ON sa.id=s.account_id WHERE s.id=$1",
     [account.preferred_shop_id],
   )).rows[0]?.login_code : null;
-  return { id: account.id, accountId: account.login_code || null, role: account.role, name: account.name, preferredShopId: preferred || null };
+  return { id: account.id, accountId: account.login_code || null, role: account.role, name: account.name, attendanceEnabled: account.status === "ACTIVE", preferredShopId: preferred || null };
 }
 app.get("/api/v1/me", async (req, res) =>
   res.json({ data: await accountInfo(req.account) }),
@@ -214,7 +249,7 @@ app.post("/api/v1/me/preferences", async (req, res) => {
         [body.preferredShopId],
       )).rows[0];
       if (!shop) fail(422, "Unknown preferred shop");
-      if (req.account.role !== "WORKER") await assertShop(c, req.account, shop.id);
+      if (!["WORKER", ...backend].includes(req.account.role)) await assertShop(c, req.account, shop.id);
     }
     await c.query("UPDATE accounts SET preferred_shop_id=$1,profile_version=profile_version+1 WHERE id=$2", [shop?.id || null, req.account.id]);
     return { preferredShopId: body.preferredShopId };
@@ -226,6 +261,11 @@ async function profileInfo(account, c = pool) {
     lastName: account.last_name || "", address: account.profile_address, phone: account.profile_phone,
     version: account.profile_version };
 }
+app.get("/api/v1/me/stores", async (req, res) => {
+  if (!["WORKER", ...backend].includes(req.account.role)) fail(403, "Personal account required");
+  const data = (await pool.query('SELECT s.id,s.name,a.login_code AS "shopId" FROM shops s JOIN accounts a ON a.id=s.account_id ORDER BY s.name')).rows;
+  res.json({ data });
+});
 app.get("/api/v1/me/profile", async (req, res) => res.json({ data: await profileInfo(req.account) }));
 app.post("/api/v1/me/profile", async (req, res) => {
   const body = z.object({
@@ -241,7 +281,7 @@ app.post("/api/v1/me/profile", async (req, res) => {
     if (body.preferredShopId !== null) {
       preferred = (await c.query("SELECT s.id FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1", [body.preferredShopId])).rows[0];
       if (!preferred) fail(422, "Unknown preferred shop");
-      if (req.account.role !== "WORKER") await assertShop(c, req.account, preferred.id);
+      if (!["WORKER", ...backend].includes(req.account.role)) await assertShop(c, req.account, preferred.id);
     }
     const name = [body.firstName, body.lastName].filter(Boolean).join(" ");
     const updated = (await c.query(
@@ -265,7 +305,7 @@ function manager(req, res, next) {
 }
 app.use("/api/v1/manager", manager);
 async function allowed(c, a, shopId) {
-  if (a.role === "SUPER_MANAGER") return true;
+  if (companyAdmin(a)) return true;
   if (a.role === "SHOP")
     return !!(
       await c.query("SELECT 1 FROM shops WHERE id=$1 AND account_id=$2", [
@@ -319,8 +359,18 @@ async function audit(c, a, action, id, before = null, after = null) {
     [a.id, action, id, before, after],
   );
 }
+async function assertWorker(c, actor, workerId) {
+  if (companyAdmin(actor)) return;
+  if (!(await c.query("SELECT 1 FROM manager_workers WHERE manager_account_id=$1 AND worker_id=$2", [actor.id, workerId])).rowCount)
+    fail(403, "Groomer outside your scope", "WORKER_FORBIDDEN");
+}
+async function assertRecordScope(c, actor, shopId, workerId) {
+  if (backend.includes(actor.role) && (await c.query("SELECT 1 FROM workers WHERE id=$1 AND account_id=$2", [workerId,actor.id])).rowCount) return;
+  if (await allowed(c, actor, shopId)) return;
+  return assertWorker(c, actor, workerId);
+}
 const scopeSql =
-  "($1='SUPER_MANAGER' OR EXISTS(SELECT 1 FROM account_shops ac WHERE ac.shop_id=s.id AND ac.account_id=$2))";
+  "($1 IN('SUPER_MANAGER','GENERAL_MANAGER') OR EXISTS(SELECT 1 FROM account_shops ac WHERE ac.shop_id=s.id AND ac.account_id=$2))";
 app.get(["/api/v1/shops", "/api/v1/manager/shops"], async (req, res) => {
   let r;
   if (req.account.role === "SHOP")
@@ -341,7 +391,7 @@ app.get(["/api/v1/shops", "/api/v1/manager/shops"], async (req, res) => {
   res.json({ data: r.rows });
 });
 app.post("/api/v1/manager/shops", async (req, res) => {
-  if (req.account.role !== "SUPER_MANAGER") fail(403, "Owner required");
+  if (!companyAdmin(req.account)) fail(403, "Company administrator required");
   const b = z
     .object({
       operationId: uuid,
@@ -353,7 +403,7 @@ app.post("/api/v1/manager/shops", async (req, res) => {
       address: z.string().trim().min(1).max(500),
       latitude: z.number().min(-90).max(90).optional(),
       longitude: z.number().min(-180).max(180).optional(),
-      password: z.string().min(12).max(128),
+      password: z.string().min(6).max(128),
     })
     .parse(req.body);
   const pw = await argon2.hash(b.password);
@@ -381,16 +431,25 @@ app.post("/api/v1/manager/shops", async (req, res) => {
   );
   res.status(201).json({ data });
 });
+app.get("/api/v1/manager/attendance/stores", async (req, res) => {
+  const result = await pool.query(`SELECT s.id,s.name,a.login_code AS "shopId" FROM shops s JOIN accounts a ON a.id=s.account_id WHERE $1 IN('SUPER_MANAGER','GENERAL_MANAGER') OR EXISTS(SELECT 1 FROM account_shops ac WHERE ac.account_id=$2 AND ac.shop_id=s.id) OR EXISTS(SELECT 1 FROM manager_workers mw WHERE mw.manager_account_id=$2) ORDER BY s.name`, [req.account.role, req.account.id]);
+  res.json({ data: result.rows });
+});
+app.get("/api/v1/manager/attendance/groomers", async (req, res) => {
+  const result = await pool.query(`SELECT w.id,a.id AS "accountId",a.name,a.login_code AS "workerId",a.status FROM workers w JOIN accounts a ON a.id=w.account_id WHERE a.role='WORKER' AND a.status='ACTIVE' AND ($1 IN('SUPER_MANAGER','GENERAL_MANAGER') OR EXISTS(SELECT 1 FROM manager_workers mw WHERE mw.manager_account_id=$2 AND mw.worker_id=w.id) OR EXISTS(SELECT 1 FROM account_shops ac WHERE ac.account_id=$2)) ORDER BY a.name`, [req.account.role, req.account.id]);
+  res.json({ data: result.rows });
+});
 app.get("/api/v1/manager/workers", async (req, res) => {
   const r = await pool.query(
-    `SELECT w.id,a.id AS "accountId",a.login_code AS "workerId",a.name,a.email,a.status FROM workers w JOIN accounts a ON a.id=w.account_id ORDER BY a.name`,
+    `SELECT w.id,a.id AS "accountId",a.login_code AS "workerId",a.name,a.email,a.status,a.requires_manager_approval,(a.password_hash IS NOT NULL) AS password_set,a.first_name AS "firstName",a.last_name AS "lastName",a.profile_address AS address,a.profile_phone AS phone,a.profile_version AS version,sa.login_code AS "preferredShopId" FROM workers w JOIN accounts a ON a.id=w.account_id LEFT JOIN shops ps ON ps.id=a.preferred_shop_id LEFT JOIN accounts sa ON sa.id=ps.account_id WHERE a.role='WORKER' AND ($1 IN('SUPER_MANAGER','GENERAL_MANAGER') OR EXISTS(SELECT 1 FROM manager_workers mw WHERE mw.manager_account_id=$2 AND mw.worker_id=w.id)) ORDER BY a.name`,
+    [req.account.role, req.account.id],
   );
   res.json({ data: r.rows });
 });
 app.get("/api/v1/manager/managers", async (req, res) => {
-  if (req.account.role !== "SUPER_MANAGER") fail(403, "Owner required");
+  if (!companyAdmin(req.account)) fail(403, "Company administrator required");
   const r = await pool.query(
-    "SELECT id AS \"accountId\",name,email,status FROM accounts WHERE role='MANAGER' ORDER BY name",
+    `SELECT a.id AS "accountId",a.role,a.name,a.email,a.status,a.first_name AS "firstName",a.last_name AS "lastName",a.profile_address AS address,a.profile_phone AS phone,a.profile_version AS version,sa.login_code AS "preferredShopId" FROM accounts a LEFT JOIN shops ps ON ps.id=a.preferred_shop_id LEFT JOIN accounts sa ON sa.id=ps.account_id WHERE a.role IN('MANAGER','GENERAL_MANAGER') ORDER BY a.name`,
   );
   res.json({ data: r.rows });
 });
@@ -415,7 +474,7 @@ async function invite(c, account, purpose = "FIRST_SETUP") {
     [account.id],
   );
   await c.query(
-    "UPDATE email_jobs SET status='CANCELLED',encrypted_payload=NULL WHERE account_id=$1 AND status IN('QUEUED','FAILED')",
+    "UPDATE email_jobs SET status='CANCELLED',encrypted_payload=NULL WHERE account_id=$1 AND kind='PASSWORD_LINK' AND status IN('QUEUED','FAILED')",
     [account.id],
   );
   const p = (
@@ -439,7 +498,7 @@ app.post(
   ["/api/v1/manager/workers", "/api/v1/manager/managers"],
   async (req, res) => {
     const isManager = req.path.endsWith("/managers");
-    if (isManager && req.account.role !== "SUPER_MANAGER")
+    if (isManager && !companyAdmin(req.account))
       fail(403, "Only owner can add managers");
     const b = z
       .object({
@@ -448,7 +507,11 @@ app.post(
         email: z.email(),
         shopIds: z.array(z.string().regex(/^00\d{2}$/)).default([]),
         contact: z.string().optional(),
-        address: z.string().optional(),
+        address: z.string().trim().max(500).optional(),
+        firstName: z.string().trim().min(1).max(100).optional(),
+        lastName: z.string().trim().max(100).optional(),
+        phone: z.string().trim().max(50).optional(),
+        preferredShopId: z.string().regex(/^00\d{2}$/).nullable().optional(),
       })
       .parse(req.body);
     const data = await transaction((c) =>
@@ -465,11 +528,20 @@ app.post(
           await assertShop(c, req.account, s.id);
           shops.push(s.id);
         }
+        let preferred = null;
+        if (b.preferredShopId) {
+          preferred = (await c.query("SELECT s.id FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1", [b.preferredShopId])).rows[0];
+          if (!preferred) fail(422, "Unknown preferred shop");
+          if (isManager) await assertShop(c, req.account, preferred.id);
+        }
+        const firstName = b.firstName || b.name;
+        const lastName = b.lastName || "";
+        const name = [firstName, lastName].filter(Boolean).join(" ");
         let code = null;
         if (!isManager) {
           await c.query("SELECT pg_advisory_xact_lock(820013)");
           const codes = (
-            await c.query("SELECT login_code FROM accounts WHERE role='WORKER'")
+            await c.query("SELECT login_code FROM accounts WHERE login_code ~ '^[1-9][0-9]{3}$'")
           ).rows.map((x) => x.login_code);
           const available = [];
           for (let i = 1000; i <= 9999; i++)
@@ -479,25 +551,27 @@ app.post(
         }
         const a = (
           await c.query(
-            "INSERT INTO accounts(role,login_code,email,name) VALUES($1,$2,$3,$4) RETURNING *",
+            "INSERT INTO accounts(role,login_code,email,name,first_name,last_name,profile_address,profile_phone,preferred_shop_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",
             [
               isManager ? "MANAGER" : "WORKER",
               code,
               b.email.toLowerCase(),
-              b.name,
+              name, firstName, lastName, b.address || "", b.phone ?? b.contact ?? "", preferred?.id || null,
             ],
           )
         ).rows[0];
         if (!isManager)
           await c.query(
             "INSERT INTO workers(account_id,contact,address) VALUES($1,$2,$3)",
-            [a.id, b.contact || "", b.address || ""],
+            [a.id, b.phone ?? b.contact ?? "", b.address || ""],
           );
         for (const s of shops)
           await c.query(
             "INSERT INTO account_shops(account_id,shop_id) VALUES($1,$2)",
             [a.id, s],
           );
+        await c.query("UPDATE accounts SET requires_manager_approval=true WHERE id=$1", [a.id]);
+        if (!isManager && req.account.role === "MANAGER") await c.query("INSERT INTO manager_workers(manager_account_id,worker_id) SELECT $1,id FROM workers WHERE account_id=$2 ON CONFLICT DO NOTHING", [req.account.id, a.id]);
         const invitationId = await invite(c, a);
         await audit(c, req.account, "ACCOUNT_CREATE", a.id);
         return {
@@ -512,6 +586,83 @@ app.post(
     res.status(201).json({ data });
   },
 );
+async function managedPerson(c, actor, accountId) {
+  const person = (await c.query("SELECT * FROM accounts WHERE id=$1 FOR UPDATE", [accountId])).rows[0];
+  if (!person || !["WORKER", "MANAGER"].includes(person.role)) fail(404, "Person not found");
+  if (person.role === "MANAGER" && !companyAdmin(actor)) fail(403, "Only owner can manage managers");
+  if (person.role === "WORKER") {
+    const worker = (await c.query("SELECT id FROM workers WHERE account_id=$1", [person.id])).rows[0];
+    await assertWorker(c, actor, worker.id);
+  }
+  return person;
+}
+app.post("/api/v1/manager/accounts/:id/profile", async (req, res) => {
+  const accountId = uuid.parse(req.params.id);
+  const b = z.object({ operationId: uuid, expectedVersion: z.number().int().positive(),
+    firstName: z.string().trim().min(1).max(100), lastName: z.string().trim().max(100),
+    address: z.string().trim().max(500), phone: z.string().trim().max(50),
+    preferredShopId: z.string().regex(/^00\d{2}$/).nullable(),
+  }).strict().parse(req.body);
+  const data = await transaction(c => idem(c, req.account, { ...b, accountId }, "MANAGED_PROFILE", async () => {
+    const person = await managedPerson(c, req.account, accountId);
+    if (person.status === "DISABLED") fail(409, "Account has been deleted");
+    if (person.profile_version !== b.expectedVersion) fail(409, "Profile changed; reload before saving", "PROFILE_CHANGED");
+    let preferred = null;
+    if (b.preferredShopId) {
+      preferred = (await c.query("SELECT s.id FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1", [b.preferredShopId])).rows[0];
+      if (!preferred) fail(422, "Unknown preferred shop");
+      if (person.role === "MANAGER") await assertShop(c, req.account, preferred.id);
+    }
+    const updated = (await c.query("UPDATE accounts SET first_name=$1,last_name=$2,name=$3,profile_address=$4,profile_phone=$5,preferred_shop_id=$6,profile_version=profile_version+1 WHERE id=$7 RETURNING *",
+      [b.firstName, b.lastName, [b.firstName, b.lastName].filter(Boolean).join(" "), b.address, b.phone, preferred?.id || null, accountId])).rows[0];
+    await c.query("UPDATE workers SET address=$1,contact=$2 WHERE account_id=$3", [b.address, b.phone, accountId]);
+    await audit(c, req.account, "MANAGED_PROFILE_UPDATE", accountId,
+      { name: person.name, address: person.profile_address, phone: person.profile_phone, preferredShopId: person.preferred_shop_id },
+      { name: updated.name, address: b.address, phone: b.phone, preferredShopId: preferred?.id || null });
+    return profileInfo(updated, c);
+  }));
+  res.json({ data });
+});
+app.post("/api/v1/manager/accounts/:id/remove", async (req, res) => {
+  const accountId = uuid.parse(req.params.id);
+  const b = z.object({ operationId: uuid, expectedVersion: z.number().int().positive() }).strict().parse(req.body);
+  const data = await transaction(c => idem(c, req.account, { ...b, accountId }, "PERSON_REMOVE", async () => {
+    const person = await managedPerson(c, req.account, accountId);
+    if (person.id === req.account.id) fail(403, "You cannot delete your own account");
+    if (person.profile_version !== b.expectedVersion || person.status === "DISABLED") fail(409, "Account changed; reload");
+    await c.query("UPDATE accounts SET status='DISABLED',profile_version=profile_version+1 WHERE id=$1", [accountId]);
+    await c.query("UPDATE sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL", [accountId]);
+    await c.query("UPDATE password_links SET revoked_at=now() WHERE account_id=$1 AND used_at IS NULL", [accountId]);
+    await c.query("UPDATE email_jobs SET status='CANCELLED',encrypted_payload=NULL WHERE account_id=$1 AND status IN('QUEUED','FAILED')", [accountId]);
+    await c.query("UPDATE attendance_export_jobs SET status='FAILED',last_error_code='ACCOUNT_DISABLED' WHERE account_id=$1 AND status='QUEUED'", [accountId]);
+    await audit(c, req.account, "PERSON_REMOVED", accountId, { status: person.status }, { status: "DISABLED" });
+    return { accountId, status: "DISABLED" };
+  }));
+  res.json({ data });
+});
+app.post("/api/v1/manager/accounts/:id/approve", async (req, res) => {
+  if (req.account.role !== "GENERAL_MANAGER") fail(403, "Only the General manager can approve new personnel");
+  const accountId = uuid.parse(req.params.id);
+  const b = z.object({ operationId: uuid }).strict().parse(req.body);
+  const data = await transaction(c => idem(c, req.account, { ...b, accountId }, "ACCOUNT_APPROVAL", async () => {
+    await c.query("SELECT pg_advisory_xact_lock(820013)");
+    const account = (await c.query("SELECT * FROM accounts WHERE id=$1 FOR UPDATE", [accountId])).rows[0];
+    if (!account || !["WORKER", "MANAGER"].includes(account.role)) fail(404, "Personnel account missing");
+    if (account.status !== "PENDING" || !account.requires_manager_approval) fail(409, "Account is not awaiting approval");
+    if (!account.password_hash) fail(409, "Employee must set a password first");
+    const codes = new Set((await c.query("SELECT login_code FROM accounts WHERE login_code ~ '^[1-9][0-9]{3}$'")).rows.map(r => r.login_code));
+    const available = [];
+    for (let i = 1000; i <= 9999; i++) if (!codes.has(String(i))) available.push(String(i));
+    if (account.role === "WORKER" && !account.login_code && !available.length) fail(409, "Employee IDs exhausted");
+    const employeeCode = account.role === "WORKER" ? (account.login_code || available[randomInt(available.length)]) : account.login_code;
+    await c.query("UPDATE accounts SET status='ACTIVE',login_code=$3,approved_by_account_id=$2,approved_at=now() WHERE id=$1", [accountId, req.account.id, employeeCode]);
+    await c.query("INSERT INTO email_jobs(account_id,recipient_email,encrypted_payload,kind) VALUES($1,$2,$3,'ACCOUNT_APPROVED')",
+      [accountId, account.email, encrypt({ name: account.name, employeeCode, role: account.role })]);
+    await audit(c, req.account, "ACCOUNT_APPROVED", accountId, { status: "PENDING", employeeCode: null }, { status: "ACTIVE", employeeCode });
+    return { accountId, workerId: employeeCode, status: "ACTIVE", emailStatus: "QUEUED" };
+  }));
+  res.json({ data });
+});
 app.post("/api/v1/manager/accounts/:id/invitations", async (req, res) => {
   const b = z.object({ operationId: uuid }).parse(req.body);
   uuid.parse(req.params.id);
@@ -529,8 +680,12 @@ app.post("/api/v1/manager/accounts/:id/invitations", async (req, res) => {
         ).rows[0];
         if (!a || a.status !== "PENDING")
           fail(422, "Only pending accounts can be invited");
-        if (req.account.role !== "SUPER_MANAGER") {
+        if (!companyAdmin(req.account)) {
           if (a.role !== "WORKER") fail(403, "Owner required");
+        }
+        if (!companyAdmin(req.account)) {
+          const worker = (await c.query("SELECT id FROM workers WHERE account_id=$1", [a.id])).rows[0];
+          await assertWorker(c, req.account, worker.id);
         }
         const invitationId = await invite(c, a);
         await audit(c, req.account, "INVITATION_RESEND", a.id);
@@ -542,8 +697,8 @@ app.post("/api/v1/manager/accounts/:id/invitations", async (req, res) => {
 });
 app.get("/api/v1/manager/invitations", async (req, res) => {
   const r = await pool.query(
-    `SELECT e.id,e.account_id AS "accountId",a.name,e.status,e.last_error_code,e.created_at,p.expires_at,p.used_at FROM email_jobs e JOIN accounts a ON a.id=e.account_id JOIN password_links p ON p.id=e.password_link_id WHERE $1='SUPER_MANAGER' OR a.role='WORKER' ORDER BY e.created_at DESC LIMIT 100`,
-    [req.account.role],
+    `SELECT e.id,e.account_id AS "accountId",a.name,e.status,e.last_error_code,e.created_at,p.expires_at,p.used_at FROM email_jobs e JOIN accounts a ON a.id=e.account_id JOIN password_links p ON p.id=e.password_link_id WHERE $1 IN('SUPER_MANAGER','GENERAL_MANAGER') OR EXISTS(SELECT 1 FROM workers w JOIN manager_workers mw ON mw.worker_id=w.id WHERE w.account_id=a.id AND mw.manager_account_id=$2) ORDER BY e.created_at DESC LIMIT 100`,
+    [req.account.role, req.account.id],
   );
   res.json({ data: r.rows });
 });
@@ -630,12 +785,13 @@ function filters(req) {
     req.query.workerId || null,
   ];
 }
-const filtered = `FROM attendance_records r JOIN workers w ON w.id=r.worker_id JOIN accounts wa ON wa.id=w.account_id JOIN shops s ON s.id=r.shop_id JOIN accounts sa ON sa.id=s.account_id WHERE ${scopeSql} AND r.effective_occurred_at >= $3 AND r.effective_occurred_at < $4 AND ($5::text IS NULL OR sa.login_code=$5) AND ($6::text IS NULL OR wa.login_code=$6)`;
+const recordScopeSql = "($1 IN('SUPER_MANAGER','GENERAL_MANAGER') OR w.account_id=$2 OR EXISTS(SELECT 1 FROM account_shops ac WHERE ac.shop_id=s.id AND ac.account_id=$2) OR EXISTS(SELECT 1 FROM manager_workers mw WHERE mw.worker_id=w.id AND mw.manager_account_id=$2))";
+const filtered = `FROM attendance_records r JOIN workers w ON w.id=r.worker_id JOIN accounts wa ON wa.id=w.account_id JOIN shops s ON s.id=r.shop_id JOIN accounts sa ON sa.id=s.account_id WHERE ${recordScopeSql} AND r.effective_occurred_at >= $3 AND r.effective_occurred_at < $4 AND ($5::text IS NULL OR sa.login_code=$5) AND ($6::text IS NULL OR wa.login_code=$6)`;
 async function records(req, c = pool) {
   const f = filters(req);
   return (
     await c.query(
-      `SELECT r.*,wa.name AS worker_name,wa.login_code AS "workerId",s.name AS shop_name,sa.login_code AS "shopId",EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending ${filtered} AND ($1='SUPER_MANAGER' OR NOT r.effective_deleted) ORDER BY r.effective_occurred_at,r.id`,
+      `SELECT r.*,(SELECT x.after_type FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING' LIMIT 1) AS pending_sign_type,wa.name AS worker_name,wa.login_code AS "workerId",s.name AS shop_name,sa.login_code AS "shopId",EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending ${filtered} AND ($1='SUPER_MANAGER' OR NOT r.effective_deleted) ORDER BY r.effective_occurred_at,r.id`,
       f,
     )
   ).rows;
@@ -644,7 +800,7 @@ async function summary(req, c = pool) {
   const f = filters(req);
   return (
     await c.query(
-      `SELECT wa.login_code AS "workerId",wa.name AS worker_name,sa.login_code AS "shopId",s.name AS shop_name,COALESCE(sum(g.hrs) FILTER(WHERE g.status='CONFIRMED'),0)::numeric(12,2)::text AS "confirmedHrs",count(*) FILTER(WHERE g.status='PENDING')::int AS "pendingSegmentCount",count(*) FILTER(WHERE g.status='INVALID')::int AS "invalidSegmentCount" FROM work_segments g JOIN workers w ON w.id=g.worker_id JOIN accounts wa ON wa.id=w.account_id JOIN shops s ON s.id=g.shop_id JOIN accounts sa ON sa.id=s.account_id LEFT JOIN attendance_records rr ON rr.id=COALESCE(g.sign_in_record_id,g.sign_out_record_id) WHERE ${scopeSql} AND COALESCE(g.start_at,rr.effective_occurred_at)>=$3 AND COALESCE(g.start_at,rr.effective_occurred_at)<$4 AND ($5::text IS NULL OR sa.login_code=$5) AND ($6::text IS NULL OR wa.login_code=$6) GROUP BY wa.login_code,wa.name,sa.login_code,s.name ORDER BY wa.name`,
+      `SELECT wa.login_code AS "workerId",wa.name AS worker_name,sa.login_code AS "shopId",s.name AS shop_name,COALESCE(sum(g.hrs) FILTER(WHERE g.status='CONFIRMED'),0)::numeric(12,2)::text AS "confirmedHrs",count(*) FILTER(WHERE g.status='PENDING')::int AS "pendingSegmentCount",count(*) FILTER(WHERE g.status='INVALID')::int AS "invalidSegmentCount" FROM work_segments g JOIN workers w ON w.id=g.worker_id JOIN accounts wa ON wa.id=w.account_id JOIN shops s ON s.id=g.shop_id JOIN accounts sa ON sa.id=s.account_id LEFT JOIN attendance_records rr ON rr.id=COALESCE(g.sign_in_record_id,g.sign_out_record_id) WHERE ${recordScopeSql} AND COALESCE(g.start_at,rr.effective_occurred_at)>=$3 AND COALESCE(g.start_at,rr.effective_occurred_at)<$4 AND ($5::text IS NULL OR sa.login_code=$5) AND ($6::text IS NULL OR wa.login_code=$6) GROUP BY wa.login_code,wa.name,sa.login_code,s.name ORDER BY wa.name`,
       f,
     )
   ).rows;
@@ -689,7 +845,7 @@ app.get(
         ])
       ).rows[0];
       if (w.account_id !== req.account.id) fail(403, "Only your own history");
-    } else await assertShop(pool, req.account, r.shop_id);
+    } else await assertRecordScope(pool, req.account, r.shop_id, r.worker_id);
     const history = (
       await pool.query(
         "SELECT a.*,v.decision,v.validated_at,u.name AS validator FROM attendance_adjustments a LEFT JOIN attendance_validations v ON v.adjustment_id=a.id LEFT JOIN accounts u ON u.id=v.validated_by_account_id WHERE a.record_id=$1 ORDER BY a.created_at",
@@ -709,11 +865,12 @@ app.get("/api/v1/manager/validations", async (req, res) => {
   ).rows;
   const issues = (
     await pool.query(
-      `SELECT g.id,g.issue_code,g.sign_in_record_id,g.sign_out_record_id,r.version,wa.name AS worker_name,s.name AS shop_name,'RECORD_ERROR' AS item_type ${filtered.replace("FROM attendance_records r", "FROM work_segments g JOIN attendance_records r ON r.id=COALESCE(g.sign_in_record_id,g.sign_out_record_id)")} AND g.status='INVALID'`,
+      `SELECT g.id,g.issue_code,g.sign_in_record_id,g.sign_out_record_id,r.version,w.id AS worker_id,COALESCE(wa.login_code,'__worker__'||w.id::text) AS worker_code,sa.login_code AS shop_code,(r.effective_occurred_at AT TIME ZONE 'Pacific/Auckland')::date::text AS local_date,r.original_occurred_at,wa.name AS worker_name,s.name AS shop_name,'RECORD_ERROR' AS item_type ${filtered.replace("FROM attendance_records r", "FROM work_segments g JOIN attendance_records r ON r.id=COALESCE(g.sign_in_record_id,g.sign_out_record_id)")} AND g.status='INVALID'`,
       f,
     )
   ).rows;
-  res.json({ data: [...adjustments, ...issues] });
+  const people = req.account.role === "GENERAL_MANAGER" ? (await pool.query("SELECT id AS account_id,name AS worker_name,email,profile_version AS version,role,'PERSON_APPROVAL' AS item_type,'NEW_PERSON' AS source FROM accounts WHERE status='PENDING' AND requires_manager_approval AND password_hash IS NOT NULL AND role IN('WORKER','MANAGER') ORDER BY created_at")).rows : [];
+  res.json({ data: [...people, ...adjustments, ...issues] });
 });
 app.post("/api/v1/manager/validations/:id/decision", async (req, res) => {
   uuid.parse(req.params.id);
@@ -731,20 +888,11 @@ app.post("/api/v1/manager/validations/:id/decision", async (req, res) => {
       { ...b, adjustmentId: req.params.id },
       "VALIDATION",
       async () => {
-        const j = (
-          await c.query(
-            "SELECT * FROM attendance_adjustments WHERE id=$1 FOR UPDATE",
-            [req.params.id],
-          )
-        ).rows[0];
-        if (!j) fail(404, "Adjustment missing");
-        const r = (
-          await c.query(
-            "SELECT * FROM attendance_records WHERE id=$1 FOR UPDATE",
-            [j.record_id],
-          )
-        ).rows[0];
-        await assertShop(c, req.account, r.shop_id);
+        const reference = (await c.query("SELECT record_id FROM attendance_adjustments WHERE id=$1", [req.params.id])).rows[0];
+        if (!reference) fail(404, "Adjustment missing");
+        const r = (await c.query("SELECT * FROM attendance_records WHERE id=$1 FOR UPDATE", [reference.record_id])).rows[0];
+        const j = (await c.query("SELECT * FROM attendance_adjustments WHERE id=$1 FOR UPDATE", [req.params.id])).rows[0];
+        await assertRecordScope(c, req.account, r.shop_id, r.worker_id);
         if (r.version !== b.expectedRecordVersion || j.status !== "PENDING")
           fail(409, "Record changed; reload", "VERSION_CONFLICT");
         if (
@@ -761,9 +909,7 @@ app.post("/api/v1/manager/validations/:id/decision", async (req, res) => {
         const deleted =
           b.decision === "APPROVE"
             ? j.action === "DELETE"
-            : j.action === "ADD"
-              ? true
-              : r.confirmed_deleted;
+            : r.confirmed_deleted;
         await c.query(
           "UPDATE attendance_adjustments SET status=$1 WHERE id=$2",
           [b.decision === "APPROVE" ? "APPROVED" : "REJECTED", j.id],
@@ -773,8 +919,8 @@ app.post("/api/v1/manager/validations/:id/decision", async (req, res) => {
           [j.id, req.account.id, b.decision, r.confirmed_occurred_at, t],
         );
         await c.query(
-          "UPDATE attendance_records SET confirmed_occurred_at=$1,effective_occurred_at=COALESCE($1,original_occurred_at),confirmed_deleted=$2,effective_deleted=$2,version=version+1 WHERE id=$3",
-          [t, deleted, r.id],
+          "UPDATE attendance_records SET confirmed_occurred_at=$1,effective_occurred_at=COALESCE($1,original_occurred_at),confirmed_deleted=$2,effective_deleted=$2,sign_type=$4,manager_confirmed=manager_confirmed OR $5,version=version+1 WHERE id=$3",
+          [t, deleted, r.id, b.decision === "APPROVE" ? (j.after_type || r.sign_type) : r.sign_type, b.decision === "APPROVE"],
         );
         await rebuild(c, r.worker_id);
         await audit(c, req.account, "VALIDATION_" + b.decision, r.id);
@@ -791,10 +937,11 @@ app.post("/api/v1/manager/attendance/:id/corrections", async (req, res) => {
       operationId: uuid,
       expectedRecordVersion: z.number().int().positive(),
       occurredAt: instant,
+      type: z.enum(["SIGN_IN", "SIGN_OUT"]).optional(),
     })
     .parse(req.body);
   req.body = { operationId: b.operationId, action: "UPDATE", recordId: req.params.id,
-    expectedVersion: b.expectedRecordVersion, occurredAt: b.occurredAt };
+    expectedVersion: b.expectedRecordVersion, occurredAt: b.occurredAt, type: b.type };
   return attendanceAdjustment(req, res);
 });
 app.post("/api/v1/attendance", async (req, res) => {
@@ -837,7 +984,7 @@ app.post("/api/v1/attendance", async (req, res) => {
           [b.shopId],
         )
       ).rows[0];
-      if (!w || !s) fail(422, "Unknown worker or shop");
+      if (!w || (!s && !(allowAllShops && !shopCode && req.account.role !== "SHOP"))) fail(422, "Unknown worker or shop");
       if (req.account.role === "WORKER") {
         if (w.account_id !== req.account.id)
           fail(403, "Cannot sign for another worker");
@@ -845,8 +992,7 @@ app.post("/api/v1/attendance", async (req, res) => {
       if (b.expectedDailyCount !== undefined) {
         const day = localDate(b.occurredAt);
         const count = await dailyAttendanceCount(c, w.id, s.id, day);
-        if (day !== localDate(new Date()) || count !== b.expectedDailyCount ||
-            b.type !== (count % 2 === 0 ? "SIGN_IN" : "SIGN_OUT"))
+        if (day !== localDate(new Date()) || count !== b.expectedDailyCount)
           fail(409, "Attendance changed; refresh today's status", "ATTENDANCE_CHANGED");
       }
       if (b.cameraStatus === "AVAILABLE") {
@@ -901,15 +1047,7 @@ app.post("/api/v1/attendance", async (req, res) => {
         fail(422, "First sign in requires planned time");
       if (b.plannedStartAt && localDate(b.plannedStartAt) !== day)
         fail(422, "Plan must be on sign-in date");
-      const late =
-        first &&
-        b.type === "SIGN_IN" &&
-        new Date(b.occurredAt) > new Date(b.plannedStartAt);
-      const formal =
-        first && b.type === "SIGN_IN" && !late
-          ? b.plannedStartAt
-          : b.occurredAt;
-      const effective = late ? b.plannedStartAt : b.occurredAt;
+      const effective = b.occurredAt;
       const r = (
         await c.query(
           "INSERT INTO attendance_records(worker_id,shop_id,submitted_by_account_id,sign_type,source,original_occurred_at,planned_start_at,effective_occurred_at,confirmed_occurred_at,offline,camera_status,photo_id,location) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *",
@@ -922,7 +1060,7 @@ app.post("/api/v1/attendance", async (req, res) => {
             b.occurredAt,
             first ? b.plannedStartAt || null : null,
             effective,
-            formal,
+            b.occurredAt,
             b.offline,
             b.cameraStatus,
             b.photoId || null,
@@ -930,18 +1068,13 @@ app.post("/api/v1/attendance", async (req, res) => {
           ],
         )
       ).rows[0];
-      if (late)
-        await c.query(
-          "INSERT INTO attendance_adjustments(record_id,actor_account_id,source,action,before_at,after_at,base_version) VALUES($1,$2,'PLANNED_START','UPDATE',$3,$4,1)",
-          [r.id, req.account.id, b.occurredAt, b.plannedStartAt],
-        );
       await rebuild(c, w.id);
       return {
         recordId: r.id,
         shopId: b.shopId, shopName: s.name, occurredAt: r.original_occurred_at, type: r.sign_type,
         dailyCount: await dailyAttendanceCount(c, w.id, s.id, day),
         syncStatus: "SYNCED",
-        validationStatus: late ? "PENDING" : "CONFIRMED",
+        validationStatus: "SUBMITTED",
       };
     }),
   );
@@ -982,8 +1115,13 @@ app.post("/api/v1/manager/reports/pdf", async (req, res) => {
       return { reportId: r.id, snapshot };
     });
   });
-  for (const shopId of data.snapshot.scopeIds)
-    await assertShop(pool, req.account, shopId);
+  for (const record of data.snapshot.records)
+    await assertRecordScope(pool, req.account, record.shop_id, record.worker_id);
+  for (const group of data.snapshot.groups) {
+    const ids = (await pool.query("SELECT w.id AS worker_id,s.id AS shop_id FROM workers w JOIN accounts wa ON wa.id=w.account_id CROSS JOIN shops s JOIN accounts sa ON sa.id=s.account_id WHERE wa.login_code=$1 AND sa.login_code=$2", [group.workerId, group.shopId])).rows[0];
+    if (!ids) fail(403, "Report scope unavailable");
+    await assertRecordScope(pool, req.account, ids.shop_id, ids.worker_id);
+  }
   res.type("pdf");
   res.setHeader(
     "Content-Disposition",
@@ -1010,11 +1148,12 @@ app.post("/api/v1/manager/reports/pdf", async (req, res) => {
         );
   doc.end();
 });
-async function appScope(req, c, shopCode, workerCode) {
+async function appScope(req, c, shopCode, workerCode, allowAllShops = false) {
+  if (backend.includes(req.account.role)) await c.query("INSERT INTO workers(account_id,contact,address) VALUES($1,$2,$3) ON CONFLICT(account_id) DO NOTHING", [req.account.id, req.account.profile_phone, req.account.profile_address]);
   const w = (
     await c.query(
-      "SELECT w.*,a.login_code FROM workers w JOIN accounts a ON a.id=w.account_id WHERE a.login_code=$1",
-      [workerCode],
+      "SELECT w.*,a.login_code FROM workers w JOIN accounts a ON a.id=w.account_id WHERE ($1::text IS NOT NULL AND a.login_code=$1) OR ($1::text IS NULL AND a.id=$2 AND a.role IN('WORKER','MANAGER','GENERAL_MANAGER','SUPER_MANAGER'))",
+      [workerCode || null, req.account.id],
     )
   ).rows[0];
   const s = (
@@ -1023,8 +1162,8 @@ async function appScope(req, c, shopCode, workerCode) {
       [shopCode],
     )
   ).rows[0];
-  if (!w || !s) fail(422, "Unknown worker or shop");
-  if (req.account.role === "WORKER") {
+  if (!w || (!s && !(allowAllShops && !shopCode && req.account.role !== "SHOP"))) fail(422, "Unknown worker or shop");
+  if (["WORKER", ...backend].includes(req.account.role)) {
     if (w.account_id !== req.account.id) fail(403, "Only your own records");
   } else if (req.account.role === "SHOP")
     await assertShop(c, req.account, s.id);
@@ -1058,21 +1197,80 @@ app.get("/api/v1/attendance/status", async (req, res) => {
     data: {
       localDate: day,
       timezone: zone,
+      attendanceEnabled: req.account.status === "ACTIVE",
       serverTime: new Date().toISOString(),
       dailyCount: count,
-      nextAction: count % 2 === 0 ? "SIGN_IN" : "SIGN_OUT",
       requiresPlannedStart: !any,
       latestRecordId: r?.id || null,
     },
   });
 });
-app.get("/api/v1/attendance", async (req, res) => {
-  const { w, s } = await appScope(
-    req,
-    pool,
-    req.query.shopId,
-    req.query.workerId || req.account.login_code,
-  );
+function selectedCodes(value, pattern) {
+  if (value == null || value === "") return [];
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  return [...new Set(z.array(z.string().regex(pattern)).max(200).parse(list))];
+}
+async function attendanceStores(c, value) {
+  const codes=selectedCodes(value,/^00\d{2}$/);
+  if (!codes.length) return {shopIds:null,s:null};
+  const rows=(await c.query("SELECT s.*,a.login_code FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=ANY($1::text[]) ORDER BY s.name",[codes])).rows;
+  if(rows.length!==codes.length) fail(422,"Unknown store");
+  return {shopIds:rows.map(r=>r.id),s:{name:rows.map(r=>r.name).join(", "),id:rows.length===1?rows[0].id:null}};
+}
+async function staffAttendanceScope(c, actor, shopCodes, workerCodes) {
+  await c.query("INSERT INTO workers(account_id,contact,address) VALUES($1,'','') ON CONFLICT(account_id) DO NOTHING",[actor.id]);
+  const codes=selectedCodes(workerCodes,/^(?:[1-9]\d{3}|__self__|__worker__[a-f0-9-]{36})$/);
+  const available=(await c.query(`SELECT w.id,a.id AS account_id,a.name,a.login_code FROM workers w JOIN accounts a ON a.id=w.account_id WHERE ($1 IN('GENERAL_MANAGER','SUPER_MANAGER') AND a.role IN('WORKER','MANAGER','GENERAL_MANAGER')) OR (a.role='WORKER' AND EXISTS(SELECT 1 FROM manager_workers mw WHERE mw.manager_account_id=$2 AND mw.worker_id=w.id)) OR a.id=$2 ORDER BY a.name`,[actor.role,actor.id])).rows;
+  const chosenShops=selectedCodes(shopCodes,/^00\d{2}$/);
+  if(actor.role==='MANAGER' && codes.length && chosenShops.length===1){
+    const permitted=(await c.query("SELECT 1 FROM account_shops x JOIN shops s ON s.id=x.shop_id JOIN accounts a ON a.id=s.account_id WHERE x.account_id=$1 AND a.login_code=$2",[actor.id,chosenShops[0]])).rowCount;
+    if(permitted){
+      const additional=(await c.query("SELECT w.id,a.id AS account_id,a.name,a.login_code FROM workers w JOIN accounts a ON a.id=w.account_id WHERE a.role='WORKER' AND (a.login_code=ANY($1::text[]) OR '__worker__'||w.id::text=ANY($1::text[]))",[codes])).rows;
+      for(const row of additional)if(!available.some(r=>r.id===row.id))available.push(row);
+    }
+  }
+  if(codes.some(code=>!available.some(r=>r.login_code===code || code==='__worker__'+r.id || (code==='__self__'&&r.account_id===actor.id)))) fail(403,"Staff outside your managed groomers");
+  const staff=codes.length?available.filter(r=>codes.includes(r.login_code)||codes.includes('__worker__'+r.id)||(codes.includes('__self__')&&r.account_id===actor.id)):available;
+  return {...await attendanceStores(c,shopCodes),workerIds:staff.map(r=>r.id),staffName:codes.length?staff.map(r=>r.name).join(", "):"All accessible staff",staffCode:staff.length===1?staff[0].login_code:null};
+}
+async function personalAttendanceScope(c,req,shopCodes,workerCodes) {
+  const codes=selectedCodes(workerCodes,/^(?:[1-9]\d{3}|__self__|__worker__[a-f0-9-]{36})$/);
+  if(codes.length>1) fail(403,"Only your own records");
+  const shops=selectedCodes(shopCodes,/^00\d{2}$/);
+  const {w}=await appScope(req,c,req.account.role==='SHOP'?shops[0]:null,codes[0]||req.account.login_code,true);
+  const scope=await attendanceStores(c,shops);
+  if(req.account.role==='SHOP') for(const id of scope.shopIds||[]) await assertShop(c,req.account,id);
+  return {...scope,workerIds:[w.id]};
+}
+app.get("/api/v1/manager/staff-attendance/staff", async (req, res) => {
+  await pool.query("INSERT INTO workers(account_id,contact,address) VALUES($1,'','') ON CONFLICT(account_id) DO NOTHING",[req.account.id]);
+  const staff=(await pool.query(`SELECT w.id,a.name,COALESCE(a.login_code,CASE WHEN a.id=$2 THEN '__self__' ELSE '__worker__'||w.id::text END) AS "workerId",a.status FROM workers w JOIN accounts a ON a.id=w.account_id WHERE (($1 IN('GENERAL_MANAGER','SUPER_MANAGER') AND a.role IN('WORKER','MANAGER','GENERAL_MANAGER')) OR (a.role='WORKER' AND EXISTS(SELECT 1 FROM manager_workers mw WHERE mw.manager_account_id=$2 AND mw.worker_id=w.id))) OR a.id=$2 ORDER BY a.name`,[req.account.role,req.account.id])).rows;
+  res.json({data:staff});
+});
+app.get("/api/v1/manager/attendance/locations", async(req,res)=>{
+  if(!companyAdmin(req.account))fail(403,"General manager or Owner required");
+  const range=z.object({fromDate:z.iso.date(),toDate:z.iso.date()}).parse(req.query);
+  if(range.fromDate>range.toDate || new Date(range.toDate)-new Date(range.fromDate)>30*86400000)fail(422,"Date range must be within 31 days");
+  const scope=await staffAttendanceScope(pool,req.account,req.query.shopIds,req.query.workerIds);
+  const cursor=z.coerce.number().int().min(0).default(0).parse(req.query.cursor);
+  const rows=(await pool.query(`SELECT r.id,r.photo_id,r.worker_id,r.shop_id,r.original_occurred_at,r.effective_occurred_at,r.confirmed_occurred_at,r.manager_confirmed,r.sign_type,r.location,wa.name AS worker_name,wa.login_code AS worker_code,s.name AS shop_name,s.latitude AS shop_latitude,s.longitude AS shop_longitude FROM attendance_records r JOIN workers w ON w.id=r.worker_id JOIN accounts wa ON wa.id=w.account_id JOIN shops s ON s.id=r.shop_id WHERE r.worker_id=ANY($1::uuid[]) AND ($2::uuid[] IS NULL OR r.shop_id=ANY($2::uuid[])) AND NOT r.confirmed_deleted AND (r.original_occurred_at AT TIME ZONE $3)::date BETWEEN $4::date AND $5::date ORDER BY r.original_occurred_at,r.id`,[scope.workerIds,scope.shopIds,zone,range.fromDate,range.toDate])).rows;
+  const records=rows.map(row=>{const gps=attendanceLocation(row.location,row.shop_latitude,row.shop_longitude);return {id:row.id,photoId:row.photo_id,workerId:row.worker_id,workerName:row.worker_name,workerCode:row.worker_code,shopName:row.shop_name,type:row.sign_type,originalTime:row.original_occurred_at,currentTime:row.effective_occurred_at,confirmedTime:row.manager_confirmed?row.confirmed_occurred_at:null,...(gps||{latitude:null,longitude:null,distanceMeters:null,accuracyMeters:null,capturedAt:null})};});
+  res.json({data:{items:records.slice(cursor,cursor+100),total:records.length,nextCursor:cursor+100<records.length?String(cursor+100):null}});
+});
+function attendanceDays(records, staffMode) {
+  const groups = new Map();
+  for (const r of records) {
+    const key=r.worker_id+":"+r.shop_id;
+    if(!groups.has(key)) groups.set(key,[]);
+    groups.get(key).push(r);
+  }
+  return [...groups.values()].flatMap(rows=>dailyAttendanceHours(rows).map(day=>({...day,workerId:rows[0].worker_id,workerCode:rows[0].worker_code || "__worker__"+rows[0].worker_id,workerName:rows[0].worker_name,shopId:rows[0].shop_id,shopCode:rows[0].shop_code,shopName:rows[0].shop_name}))).sort((a,b)=>a.date.localeCompare(b.date)||a.workerName.localeCompare(b.workerName)||a.shopName.localeCompare(b.shopName));
+}
+app.get(["/api/v1/attendance", "/api/v1/manager/staff-attendance"], async (req, res) => {
+  const staffMode = req.path.startsWith("/api/v1/manager/");
+  let scope;
+  if (staffMode) scope = await staffAttendanceScope(pool, req.account, req.query.shopIds ?? req.query.shopId, req.query.workerIds ?? req.query.workerId);
+  else scope=await personalAttendanceScope(pool,req,req.query.shopIds ?? req.query.shopId,req.query.workerIds ?? req.query.workerId);
   const range = z
     .object({ fromDate: z.iso.date(), toDate: z.iso.date() })
     .parse(req.query);
@@ -1082,10 +1280,53 @@ app.get("/api/v1/attendance", async (req, res) => {
   )
     fail(422, "Date range must be within 31 days");
   const r = await pool.query(
-    "SELECT r.*,EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending FROM attendance_records r WHERE worker_id=$1 AND shop_id=$2 AND NOT effective_deleted AND (effective_occurred_at AT TIME ZONE $3)::date BETWEEN $4::date AND $5::date ORDER BY effective_occurred_at,id",
-    [w.id, s.id, zone, range.fromDate, range.toDate],
+    "SELECT r.*,wa.name AS worker_name,wa.login_code AS worker_code,sh.name AS shop_name,sa.login_code AS shop_code,(SELECT x.after_type FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING' LIMIT 1) AS pending_sign_type,EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending FROM attendance_records r JOIN workers wr ON wr.id=r.worker_id JOIN accounts wa ON wa.id=wr.account_id JOIN shops sh ON sh.id=r.shop_id JOIN accounts sa ON sa.id=sh.account_id WHERE worker_id=ANY($1::uuid[]) AND ($2::uuid[] IS NULL OR r.shop_id=ANY($2::uuid[])) AND NOT confirmed_deleted AND (NOT effective_deleted OR EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING')) AND (effective_occurred_at AT TIME ZONE $3)::date BETWEEN $4::date AND $5::date ORDER BY effective_occurred_at,id",
+    [scope.workerIds, scope.shopIds, zone, range.fromDate, range.toDate],
   );
-  res.json({ data: { items: r.rows } });
+  const dailyHours = attendanceDays(r.rows, staffMode);
+  res.json({ data: { items: r.rows, dailyHours, totalHours: totalAttendanceHours(dailyHours) } });
+});
+app.post(["/api/v1/attendance/exports", "/api/v1/manager/staff-attendance/exports"], async (req, res) => {
+  if (!["WORKER", ...backend].includes(req.account.role)) fail(403, "Personal employee account required");
+  const b = z.object({ operationId: uuid, shopId: z.string().regex(/^00\d{2}$/).nullable().optional(),
+    workerId: z.union([z.string().regex(/^[1-9]\d{3}$/),z.literal("__self__")]).nullable().optional(),
+    shopIds: z.array(z.string().regex(/^00\d{2}$/)).max(200).optional(),
+    workerIds: z.array(z.string().regex(/^(?:[1-9]\d{3}|__self__|__worker__[a-f0-9-]{36})$/)).max(200).optional(),
+    fromDate: z.iso.date(), toDate: z.iso.date(),
+    records: z.array(z.object({ id: uuid, version: z.number().int().positive() })).min(1).max(2000),
+  }).strict().parse(req.body);
+  if (b.fromDate > b.toDate || new Date(b.toDate) - new Date(b.fromDate) > 30 * 86400000)
+    fail(422, "Date range must be within 31 days");
+  if (req.path.startsWith("/api/v1/manager/")) {
+    const scope = await staffAttendanceScope(pool,req.account,b.shopIds ?? b.shopId,b.workerIds ?? b.workerId);
+    const ids = new Set(scope.workerIds);
+    const existing = (await pool.query("SELECT worker_id FROM attendance_records WHERE id=ANY($1::uuid[])",[b.records.map(r=>r.id)])).rows;
+    if (existing.some(r=>!ids.has(r.worker_id))) fail(403,"Staff outside your managed groomers");
+  }
+  const data = await transaction(c => idem(c, req.account, b, req.path.startsWith("/api/v1/manager/") ? "STAFF_ATTENDANCE_EMAIL_EXPORT" : "ATTENDANCE_EMAIL_EXPORT", async () => {
+    const staffMode = req.path.startsWith("/api/v1/manager/");
+    let scope;
+    if (staffMode) scope=await staffAttendanceScope(c,req.account,b.shopIds ?? b.shopId,b.workerIds ?? b.workerId);
+    else scope=await personalAttendanceScope(c,req,b.shopIds ?? b.shopId,b.workerIds ?? b.workerId);
+    const s=scope.s;
+    const account = (await c.query("SELECT email,name FROM accounts WHERE id=$1", [req.account.id])).rows[0];
+    if (!account.email) fail(422, "Registered email required");
+    const result = await c.query("SELECT r.*,wa.name AS worker_name,wa.login_code AS worker_code,sh.name AS shop_name,sa.login_code AS shop_code,(SELECT x.after_type FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING' LIMIT 1) AS pending_sign_type,EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING') AS pending FROM attendance_records r JOIN workers wr ON wr.id=r.worker_id JOIN accounts wa ON wa.id=wr.account_id JOIN shops sh ON sh.id=r.shop_id JOIN accounts sa ON sa.id=sh.account_id WHERE worker_id=ANY($1::uuid[]) AND ($2::uuid[] IS NULL OR r.shop_id=ANY($2::uuid[])) AND NOT confirmed_deleted AND (NOT effective_deleted OR EXISTS(SELECT 1 FROM attendance_adjustments x WHERE x.record_id=r.id AND x.status='PENDING')) AND (effective_occurred_at AT TIME ZONE $3)::date BETWEEN $4::date AND $5::date AND r.id=ANY($6::uuid[]) ORDER BY effective_occurred_at,id FOR SHARE OF r",
+      [scope.workerIds, scope.shopIds, zone, b.fromDate, b.toDate, b.records.map(r => r.id)]);
+    const versions = new Map(b.records.map(r => [r.id, r.version]));
+    if (versions.size !== b.records.length || result.rows.length !== versions.size ||
+        result.rows.some(r => versions.get(r.id) !== r.version))
+      fail(409, "Records changed; query again before exporting");
+    const period = b.fromDate === b.toDate ? b.fromDate : `${b.fromDate} - ${b.toDate}`;
+    const subject = `Pawhub ${s?.name || "All stores"} ${period} attendence record`.replace(/[\r\n]/g, " ");
+    const snapshot = { shopId: b.shopId || (b.shopIds?.length===1?b.shopIds[0]:null), shopIds:b.shopIds || [], shopName: s?.name || "All stores", fromDate: b.fromDate, toDate: b.toDate,
+      workerName: staffMode ? scope.staffName : account.name, workerCode: staffMode ? scope.staffCode : req.account.login_code, staffMode, dailyHours:attendanceDays(result.rows,staffMode), records: result.rows };
+    const job = (await c.query("INSERT INTO attendance_export_jobs(account_id,recipient_email,subject,snapshot_data) VALUES($1,$2,$3,$4) RETURNING id",
+      [req.account.id, account.email, subject, snapshot])).rows[0];
+    await audit(c, req.account, "ATTENDANCE_EMAIL_EXPORT", job.id);
+    return { exportId: job.id, status: "QUEUED", recipientEmail: account.email };
+  }));
+  res.status(202).json({ data });
 });
 app.get("/api/v1/attendance/summary", async (req, res) => {
   const { w, s } = await appScope(
@@ -1104,7 +1345,8 @@ app.get("/api/v1/attendance/summary", async (req, res) => {
   res.json({ data: { segments: r.rows } });
 });
 async function attendanceAdjustment(req, res) {
-  const managerRequest = req.path.includes("/manager/");
+  const managerEndpoint = req.path.includes("/manager/");
+  const managerRequest = backend.includes(req.account.role);
   const b = z
     .object({
       operationId: uuid,
@@ -1123,11 +1365,11 @@ async function attendanceAdjustment(req, res) {
       if (b.action === "ADD") {
         if (!b.occurredAt || !b.type) fail(422, "Time and type required");
         let w, s;
-        if (managerRequest) {
-          w = (await c.query("SELECT w.* FROM workers w JOIN accounts a ON a.id=w.account_id WHERE a.login_code=$1 AND a.status='ACTIVE'", [b.workerId])).rows[0];
+        if (managerEndpoint) {
+          w = (await c.query("SELECT w.* FROM workers w JOIN accounts a ON a.id=w.account_id WHERE (a.login_code=$1 OR ($1='__self__' AND a.id=$2) OR $1='__worker__'||w.id::text) AND a.status='ACTIVE'", [b.workerId,req.account.id])).rows[0];
           s = (await c.query("SELECT s.* FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1", [b.shopId])).rows[0];
           if (!w || !s) fail(422, "Active employee and store required");
-          await assertShop(c, req.account, s.id);
+          await assertRecordScope(c, req.account, s.id, w.id);
         } else ({ w, s } = await appScope(req, c, b.shopId, b.workerId || req.account.login_code));
         await c.query("SELECT id FROM workers WHERE id=$1 FOR UPDATE", [w.id]);
         r = (
@@ -1146,36 +1388,44 @@ async function attendanceAdjustment(req, res) {
           )
         ).rows[0];
         if (!r) fail(404, "Record missing");
-        if (managerRequest) await assertShop(c, req.account, r.shop_id);
-        else await appScope(req, c, r.shop_code, r.worker_code);
-        if (r.effective_deleted) fail(409, "Record is already marked for removal");
+        if (managerEndpoint) await assertRecordScope(c, req.account, r.shop_id, r.worker_id);
+        else {
+          const own = (await c.query("SELECT account_id FROM workers WHERE id=$1", [r.worker_id])).rows[0];
+          if (req.account.role !== "SHOP" && own.account_id !== req.account.id) fail(403, "Only your own records");
+          await appScope(req, c, r.shop_code, r.worker_code);
+        }
+        if (!managerRequest && r.manager_confirmed) fail(403, "Confirmed records can only be changed by a manager", "RECORD_CONFIRMED");
+        if (r.confirmed_deleted) fail(409, "Record is already marked for removal");
         if (r.version !== b.expectedVersion) fail(409, "Record changed");
         if (b.action === "UPDATE" && !b.occurredAt) fail(422, "Time required");
       }
-      if (
-        (
-          await c.query(
-            "SELECT 1 FROM attendance_adjustments WHERE record_id=$1 AND status='PENDING'",
-            [r.id],
-          )
-        ).rowCount
-      )
-        fail(409, "Resolve pending change before another adjustment");
+      const pending = (await c.query("SELECT * FROM attendance_adjustments WHERE record_id=$1 AND status='PENDING' FOR UPDATE", [r.id])).rows;
+      if (!managerRequest && pending.length > 1) fail(409, "Multiple pending changes require manager resolution");
+      if (managerRequest) {
+        for (const old of pending) {
+          await c.query("UPDATE attendance_adjustments SET status='REJECTED' WHERE id=$1",[old.id]);
+          await c.query("INSERT INTO attendance_validations(adjustment_id,validated_by_account_id,decision,previous_confirmed_at,resulting_confirmed_at) VALUES($1,$2,'REJECT',$3,$3)",[old.id,req.account.id,r.confirmed_occurred_at]);
+          await audit(c,req.account,"ATTENDANCE_REQUEST_SUPERSEDED",r.id,{adjustmentId:old.id},{reason:"Direct manager change"});
+        }
+        const deleting=b.action === "DELETE", type=b.type || r.sign_type, after=deleting ? null : b.occurredAt;
+        const adjustment=(await c.query("INSERT INTO attendance_adjustments(record_id,actor_account_id,source,action,before_at,after_at,base_version,status,before_type,after_type) VALUES($1,$2,'MANAGER_EDIT',$3,$4,$5,$6,'APPROVED',$7,$8) RETURNING id",[r.id,req.account.id,b.action,b.action==='ADD'?null:r.effective_occurred_at,after,r.version,b.action==='ADD'?null:r.sign_type,deleting?null:type])).rows[0];
+        await c.query("INSERT INTO attendance_validations(adjustment_id,validated_by_account_id,decision,previous_confirmed_at,resulting_confirmed_at) VALUES($1,$2,'APPROVE',$3,$4)",[adjustment.id,req.account.id,r.confirmed_occurred_at,after]);
+        await c.query("UPDATE attendance_records SET sign_type=$2,effective_occurred_at=COALESCE($3,effective_occurred_at),confirmed_occurred_at=COALESCE($3,confirmed_occurred_at),effective_deleted=$4,confirmed_deleted=$4,manager_confirmed=true,version=version+1 WHERE id=$1",[r.id,type,after,deleting]);
+        await rebuild(c,r.worker_id);
+        await audit(c,req.account,"ATTENDANCE_MANAGER_"+b.action,r.id,{time:r.effective_occurred_at,type:r.sign_type},{time:after,type:deleting?null:type});
+        return {recordId:r.id,adjustmentId:adjustment.id,recordStatus:deleting?"removal":"active",validationStatus:"APPROVED",version:r.version+1};
+      }
       const after = b.action === "DELETE" ? null : b.occurredAt;
-      const j = (
-        await c.query(
-          "INSERT INTO attendance_adjustments(record_id,actor_account_id,source,action,before_at,after_at,base_version) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-          [
-            r.id,
-            req.account.id,
-            managerRequest ? "MANAGER_EDIT" : "WORKER_EDIT",
-            b.action,
-            b.action === "ADD" ? null : r.effective_occurred_at,
-            after,
-            r.version,
-          ],
-        )
-      ).rows[0];
+      const finalType = b.type || pending[0]?.after_type || r.sign_type;
+      const j = pending.length
+        ? (await c.query("UPDATE attendance_adjustments SET actor_account_id=$2,action=$3,after_at=$4,after_type=$5,base_version=$6 WHERE id=$1 RETURNING id",
+            [pending[0].id, req.account.id, b.action, after, b.action === "DELETE" ? null : finalType, r.version])).rows[0]
+        : (await c.query(
+            "INSERT INTO attendance_adjustments(record_id,actor_account_id,source,action,before_at,after_at,base_version,before_type,after_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+            [r.id, req.account.id, managerRequest ? "MANAGER_EDIT" : "WORKER_EDIT", b.action,
+              b.action === "ADD" ? null : r.original_occurred_at, after, r.version,
+              b.action === "ADD" ? null : r.sign_type, b.action === "DELETE" ? null : finalType],
+          )).rows[0];
       await c.query(
         "UPDATE attendance_records SET effective_occurred_at=COALESCE($1,effective_occurred_at),effective_deleted=$2,version=version+1 WHERE id=$3",
         [after, b.action === "DELETE", r.id],
@@ -1228,27 +1478,23 @@ app.post("/api/v1/photos", upload.single("file"), async (req, res) => {
   );
   res.status(201).json({ data });
 });
-function localPhotoPath(key) {
-  if (!/^local:photos\/[a-f0-9-]{36}\/[a-f0-9-]{36}\.(jpeg|png|webp)$/.test(key))
-    fail(422, "Invalid photo storage key");
-  const directory = process.env.PHOTO_LOCAL_DIR || fileURLToPath(new URL("../data/photos/", import.meta.url));
-  return path.resolve(directory, key.slice("local:photos/".length));
-}
 async function readablePhoto(req) {
   uuid.parse(req.params.id);
   const r = (
     await pool.query(
-      "SELECT p.*,r.shop_id,w.account_id AS worker_account FROM photos p LEFT JOIN attendance_records r ON r.photo_id=p.id LEFT JOIN workers w ON w.id=r.worker_id WHERE p.id=$1",
+      "SELECT p.*,r.shop_id,r.worker_id,w.account_id AS worker_account FROM photos p LEFT JOIN attendance_records r ON r.photo_id=p.id LEFT JOIN workers w ON w.id=r.worker_id WHERE p.id=$1",
       [req.params.id],
     )
   ).rows[0];
-  if (!r || r.status !== "READY") fail(404, "Photo unavailable");
+  if (!r) fail(404, "Photo unavailable");
   if (r.shop_id) {
     if (req.account.role === "WORKER") {
       if (r.worker_account !== req.account.id) fail(403, "Forbidden");
-    } else await assertShop(pool, req.account, r.shop_id);
+    } else if (r.worker_account !== req.account.id) await assertRecordScope(pool, req.account, r.shop_id, r.worker_id);
   } else if (r.uploaded_by_account_id !== req.account.id)
     fail(403, "Forbidden");
+  if (r.status === "EXPIRED") fail(410, "Photo removed after the 3-month retention period", "PHOTO_EXPIRED");
+  if (r.status !== "READY") fail(404, "Photo unavailable");
   return r;
 }
 app.get("/api/v1/photos/:id/file", async (req, res) => {
@@ -1278,6 +1524,7 @@ app.get("/api/v1/photos/:id", async (req, res) => {
   });
 });
 
+mountOrganization(app, { z, uuid, pool, transaction, idem, fail, audit, encrypt, randomInt, geocodeAddress, assertShop });
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   const status =

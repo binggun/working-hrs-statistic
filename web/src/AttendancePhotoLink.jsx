@@ -1,12 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
 
-export default function AttendancePhotoLink({ photoId, api, description }) {
+export default function AttendancePhotoLink({ photoId, api, description, children }) {
   const dialog = useRef(null);
   const request = useRef(null);
   const objectUrl = useRef(null);
   const [photo, setPhoto] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [expired, setExpired] = useState(false);
 
   function release() {
     request.current?.abort();
@@ -39,14 +40,14 @@ export default function AttendancePhotoLink({ photoId, api, description }) {
       objectUrl.current = URL.createObjectURL(blob);
       setPhoto(objectUrl.current);
     } catch (e) {
-      if (!controller.signal.aborted) setError(e.message || "Unable to load photo.");
+      if (!controller.signal.aborted) { if(e.status===410)setExpired(true); setError(e.message || "Unable to load photo."); }
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
   }
 
   return <>
-    <a href={`#photo-${photoId}`} onClick={viewPhoto}>View photo</a>
+    {expired ? <span className="text-secondary">Photo expired / 照片已清理</span> : <a href={`#photo-${photoId}`} onClick={viewPhoto}>{children || "View photo"}</a>}
     <dialog ref={dialog} className="attendance-photo-dialog" aria-label="Attendance photo" onClose={release}>
       <div className="d-flex align-items-center justify-content-between gap-3 mb-3">
         <h2 className="h3 mb-0">Attendance photo</h2>

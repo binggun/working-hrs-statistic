@@ -13,6 +13,7 @@ export default function AttendanceRecordDialog({ mode, record, shops, workers, d
   const [conflict, setConflict] = useState(false);
   useEffect(() => { dialog.current.showModal(); }, []);
   const remove = mode === "REMOVE";
+  const immediate = endpoint.includes("/manager/");
   async function submit(event) {
     event.preventDefault();
     if (saving || conflict) return;
@@ -54,12 +55,11 @@ export default function AttendanceRecordDialog({ mode, record, shops, workers, d
         <p>Remove this {record.sign_type === "SIGN_IN" ? "clock-in" : "clock-out"} record?</p>
         <p><strong>{record.shop_name || shops.find((s) => s.shopId === defaultShop)?.name}</strong><br />
           {DateTime.fromISO(record.effective_occurred_at).setZone(zone).toFormat("dd/MM/yyyy HH:mm")}</p>
-        <p>The record will be marked as removal and hidden from the normal list. Original data and photos are retained for super administrator review. This request requires approval.</p>
       </> : <fieldset disabled={saving || pending}>
-        {workers && <label className="form-label mb-3">Employee
+        {workers && <label className="form-label mb-3">Groomer
           <select required name="workerId" className="form-select mt-1" defaultValue={defaultWorker}>
-            <option value="">Select an employee</option>
-            {workers.filter((w) => w.status === "ACTIVE").map((w) => <option key={w.workerId} value={w.workerId}>{w.name} ({w.workerId})</option>)}
+            <option value="">Select a groomer</option>
+            {workers.filter((w) => w.status === "ACTIVE").map((w) => <option key={w.workerId} value={w.workerId}>{w.name} ({w.workerId === "__self__" ? "Me" : w.workerId.startsWith("__worker__") ? "No employee ID" : w.workerId})</option>)}
           </select>
         </label>}
         <label className="form-label mb-3">Store
@@ -75,7 +75,7 @@ export default function AttendanceRecordDialog({ mode, record, shops, workers, d
         <label className="form-label mb-3">Type
           <select required name="type" className="form-select mt-1"><option value="SIGN_IN">Clock in</option><option value="SIGN_OUT">Clock out</option></select>
         </label>
-        <p>This manual entry has no selfie or GPS data and requires approval.</p>
+        <p>{immediate ? "This entry takes effect immediately and is recorded in history." : "This manual entry has no selfie and requires approval."}</p>
       </fieldset>}
       <div className="d-flex gap-2 mt-3">
         <button disabled={saving || conflict} className={`btn ${remove ? "btn-danger" : "btn-primary"}`}>

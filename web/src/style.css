@@ -108,3 +108,129 @@
   box-shadow: 0 16px 64px #0004;
 }
 .attendance-record-dialog::backdrop { background: #0008; }
+
+/* Dashboard spacing shared by the manager and employee workspaces. */
+.workspace-content,
+.worker-workspace {
+  --workspace-gap: 24px;
+  width: 100%;
+  max-width: 1440px;
+  padding: 32px clamp(20px, 3vw, 40px) 48px;
+}
+.manager-workspace .navbar-vertical .container-fluid {
+  padding: 28px 20px 20px;
+  gap: 16px;
+}
+.manager-workspace .brand {
+  margin: 0 0 16px !important;
+  padding: 0 8px;
+}
+.manager-workspace .navbar-vertical .nav-link {
+  width: 100%;
+  padding: 12px 16px;
+}
+.workspace-content > header,
+.worker-workspace > header {
+  gap: 20px;
+  flex-wrap: wrap;
+  padding-bottom: 24px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.workspace-content > header h1,
+.worker-workspace > header h1 {
+  margin-bottom: 0;
+}
+.workspace-content > .card,
+.worker-workspace > .card {
+  margin-bottom: var(--workspace-gap);
+}
+.manager-workspace .card-body,
+.worker-workspace .card-body {
+  padding: 24px;
+}
+.manager-workspace .card-header,
+.worker-workspace .card-header {
+  padding: 20px 24px;
+}
+.workspace-content .card > .table-responsive,
+.worker-workspace > .card.table-responsive {
+  padding: 8px 12px;
+}
+.workspace-content .table,
+.worker-workspace .table {
+  margin-bottom: 0;
+}
+.workspace-content .table > :not(caption) > * > *,
+.worker-workspace .table > :not(caption) > * > * {
+  padding: 14px 16px;
+}
+.workspace-content .table .d-flex,
+.worker-workspace .table .d-flex {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.manager-workspace .detail .card-body {
+  padding: 24px;
+}
+@media (max-width: 991px) {
+  .manager-workspace .navbar-vertical .container-fluid {
+    padding: 20px;
+    gap: 12px;
+  }
+  .manager-workspace .navbar-vertical .nav {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .manager-workspace .navbar-vertical .nav-link {
+    width: auto;
+  }
+}
+@media (max-width: 575px) {
+  .workspace-content,
+  .worker-workspace {
+    --workspace-gap: 20px;
+    padding: 24px 16px 32px;
+  }
+  .manager-workspace .card-body,
+  .worker-workspace .card-body {
+    padding: 20px;
+  }
+  .manager-workspace .card-header,
+  .worker-workspace .card-header {
+    padding: 16px 20px;
+  }
+  .workspace-content .card > .table-responsive,
+  .worker-workspace > .card.table-responsive {
+    padding: 4px;
+  }
+}
+
+.people-dialog { width: min(94vw, 760px); padding: clamp(20px, 4vw, 32px); }
+.people-dialog fieldset { min-width: 0; border: 0; padding: 0; margin: 0; }
+.organization-checklist { max-height: 320px; overflow: auto; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; }
+.organization-checklist .form-check { margin-bottom: 12px; }
+
+/* One sidebar shared by every role; utilities stay below feature navigation. */
+.shared-workspace .navbar-vertical > .container-fluid {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+}
+.workspace-sidebar-footer {
+  border-top: 1px solid #e2e8f0;
+}
+@media (max-width: 991px) {
+  .shared-workspace .navbar-vertical > .container-fluid { min-height: auto; }
+  .shared-workspace .workspace-sidebar-footer { margin-top: 16px !important; }
+}
+
+.attendance-multiselect { position: relative; }
+.attendance-multiselect summary { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; list-style: none; }
+.attendance-multiselect summary::-webkit-details-marker { display: none; }
+.attendance-multiselect-options { position: absolute; z-index: 1050; top: calc(100% + 4px); left: 0; min-width: 100%; width: max-content; max-width: min(420px, 80vw); max-height: 300px; overflow: auto; padding: 16px; background: white; border: 1px solid #dce1e7; border-radius: 12px; box-shadow: 0 8px 24px #18243320; }
+.attendance-multiselect-options .form-check { margin-bottom: 10px; }
+.attendance-selfie-thumbnail { display: inline-flex; width: 48px; height: 48px; vertical-align: middle; }
+.attendance-selfie-thumbnail a { display: block; width: 100%; height: 100%; border-radius: 50%; }
+.attendance-selfie-thumbnail img { width: 48px; height: 48px; border-radius: 50%; object-fit: cover; }
+.attendance-selfie-thumbnail a:focus-visible { outline: 2px solid #0f766e; outline-offset: 3px; }
+.attendance-selfie-placeholder { display: flex; width: 48px; height: 48px; border-radius: 50%; background: #eef2f6; align-items: center; justify-content: center; font-size: 10px; text-align: center; }

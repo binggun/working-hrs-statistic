@@ -113,9 +113,9 @@ The employee workspace shows only the signed-in employee's attendance, filtered 
 
 ## Android attendance flow
 
-Personal employee accounts select a store, then query `/api/v1/attendance/status` for that store. The response includes `dailyCount`: an even count means SIGN_IN; an odd count means SIGN_OUT. Counts exclude effectively deleted records and use Pacific/Auckland calendar dates. First clock-in of the day retains the planned-start requirement.
+Personal employee accounts select a store, then query `/api/v1/attendance/status` for that store. The app shows separate Clock in and Clock out buttons; the user explicitly selects the type. Daily counts are informational and do not determine or restrict the selected type. Dates use Pacific/Auckland. First clock-in of the day retains the planned-start requirement.
 
-The app uploads a JPEG selfie compressed to at most 100 KiB via multipart `/api/v1/photos`, then submits its photoId, employee ID, store ID, capture timestamp and expectedDailyCount to `/api/v1/attendance`. The server verifies identity, photo ownership, date and count while holding the worker lock. Stale or concurrent submissions return 409 and require a status refresh. Retrying an uncertain request reuses its operation IDs to prevent duplicate records.
+The app uploads a JPEG selfie compressed to at most 100 KiB via multipart `/api/v1/photos`, then submits its photoId, employee ID, store ID, capture timestamp and the explicitly selected type to `/api/v1/attendance`. The server verifies identity and photo ownership while holding the worker lock. Optional expectedDailyCount checks remain supported for older clients, without a type parity restriction. Retrying an uncertain request reuses its operation IDs to prevent duplicate records.
 
 For local development, `PHOTO_STORAGE=local` stores private files under `server/data/photos` (ignored by Git). Preserve this directory with the project bind mount or a persistent volume. Local photo reads require the normal session and ownership/shop permission checks. Production S3 remains available using `PHOTO_STORAGE=s3` and existing PHOTO_BUCKET/AWS configuration.
 
@@ -142,4 +142,92 @@ Employee My attendance and manager Attendance records now offer Add attendance r
 
 Migration 005 adds record_status, generated as active or removal from effective_deleted. No attendance row, original evidence or photo is physically deleted. Removal rows disappear from employee and normal manager lists; the super administrator list retains them with a Removal label and history. Rejecting removal restores active state; approving keeps the removal state. Pending records must be resolved before another adjustment. Manual additions have no selfie/GPS and remain pending approval. Manager additions/removals follow existing shop scope and retain the real actor in the adjustment/audit log.
 
-All manual additions, time changes and removal requests—including requests submitted by managers—require an explicit manager approval decision. The legacy manager corrections endpoint also queues a pending adjustment; it no longer automatically approves a time change. Confirmed attendance and calculated confirmed hours only change after approval.
+Employee changes, manual additions and removal requests require manager approval. Manager time/type corrections take effect immediately and record an approval and audit entry. Existing pending changes must be resolved first. Migration 006 preserves original_sign_type while permitting corrections to the current sign_type; original times, photos and planned starts remain immutable.
+
+New passwords for activation, password reset, password changes, shop accounts and administrator bootstrap accept 6–128 characters, with no required character classes. Existing passwords remain valid.
+
+Employee attendance adjustments can request a new clock-in/out type as well as a time. Pending proposals retain the confirmed sign_type, expose pending_sign_type in employee queries, and store before_type/after_type in adjustment history. Approval updates sign_type and rebuilds hours; rejection leaves the confirmed type unchanged.
+
+## Employee attendance email export
+
+Android personal attendance queries offer Add record and Export side by side. Export submits the displayed record IDs and versions plus the queried store/date range to POST /api/v1/attendance/exports. The server validates ownership, range and versions, freezes a snapshot, and queues a PDF attachment to the authenticated account’s registered email; recipients cannot be overridden. Changed records return 409 for a fresh query. Retried requests reuse their operation ID.
+
+Migration 007 creates attendance_export_jobs. The backend maintenance worker sends queued exports through the existing SMTP configuration, retries failures, and records SENT only after SMTP acceptance. Subjects follow `Pawhub [shop name] [yyyy-MM-dd or yyyy-MM-dd - yyyy-MM-dd] attendence record`. PDFs use Auckland time, ascending chronological order and the bundled Noto CJK font (license in server/assets/fonts/LICENSE). Integration tests use an injected local mail transport; they do not send real email.
+
+Android New user opens a two-email registration dialog. POST /api/v1/auth/register validates matching emails, creates a pending WORKER account without an employee code, and queues the existing first-setup email. The emailed single-use link sets the password; self-registered workers remain PENDING until a manager approves activation in the worker directory. After setting a password they can sign in and view/update their profile, but attendance writes and photo uploads remain blocked until activation. Existing active/disabled accounts remain unchanged; requests return a generic acceptance response. Pending-account mail requests have a five-minute cooldown and the endpoint has an IP rate limit.
+
+Migration 008 records self-registration activation requirements, approving manager and approval timestamp. Managers can approve a pending self-registered worker only after a password is set, through POST /api/v1/manager/accounts/:id/approve. Existing administrator-created invitation behavior is unchanged.
+
+Migration 009 defers four-digit employee ID allocation for self-registered pending workers until manager approval. Approval allocates an unused code under the shared allocation lock and queues an encrypted ACCOUNT_APPROVED confirmation mail in the same transaction. The email contains activation confirmation and the employee ID, never the password. Existing pending self-registrations have their provisional codes cleared; active employee codes remain unchanged. Android refreshes its cached employee code when it checks approval status, so existing email-login sessions can start attendance after approval.
+
+## Submitted records and final manager confirmation
+
+Original app attendance is saved immediately as Submitted and does not create an approval request. Its baseline time is used for hour calculations; confirmed_occurred_at alone does not indicate manager approval. Migration 010 introduces manager_confirmed, backfilled from actual approved adjustments and approved removals, to distinguish manager-approved records from original submissions.
+
+Manual additions, changes and removals still require approval. Before approval the employee may repeatedly change the record, including replacing a pending removal with an update. The same pending adjustment is updated in place, so the manager reviews only the final proposal; original evidence and audit events remain preserved. Record versions reject stale manager approvals. Pending removals remain visible to their employee until decided. Once approved, manager_confirmed is permanent for employee permissions: only manager endpoints may modify the record further. The Android and employee web screens disable employee actions on confirmed records; the API independently enforces this rule.
+
+## People directory
+
+People shows the Android profile fields: first name, last name, registered email, address, phone and preferred store, alongside employee ID and account status. Add person opens an invitation form; Edit uses profile version checks and synchronizes accounts/workers so the Android profile immediately reflects changes. Registered email stays read-only when editing. Managers manage employees; only the owner manages manager accounts. Existing activation approval and resend invitation actions remain available.
+
+Delete requires an explicit dialog confirmation and disables the account instead of deleting account/attendance evidence. Sessions and unused password links are revoked, queued mail is cancelled, and pending attendance export delivery is stopped. Deleted accounts are hidden by default with a Show deleted accounts toggle. Migration 011 allows a disabled self-registration to retain a null employee ID.
+
+
+## Company structure and permissions
+
+Migration 012 adds an independent GENERAL_MANAGER account and manager-to-groomer assignments. Owner (SUPER_MANAGER) opens Company structure to appoint the single General manager. To initialize, create a Manager in People, have them set their password, then appoint them; appointment activates that account. Replacing the General manager demotes the previous one to Manager. Role changes revoke affected sessions.
+
+Owner and General manager can assign Manager/Groomer roles and multiple stores and groomers to each Manager. Each store or groomer can belong to multiple managers. A Manager may read or change attendance and approve adjustments when either the store OR the groomer is assigned. Full store and personal profiles require their respective assignment. Minimal attendance selectors support attendance access without exposing unrelated profiles. Revoking permissions also prevents replaying previously generated reports.
+
+All new Manager and Groomer accounts require General manager activation after password setup; only the General manager sees personnel approvals in Confirmations. Owner appoints the General manager but does not approve other personnel. Self-registered groomers receive their employee ID and confirmation email on approval. This supersedes the earlier manager activation rules. Existing managers retain store assignments; configure groomer assignments in Company structure as needed. Organization edits use version checks to prevent overwriting concurrent changes.
+
+
+## Shared personal web workspace
+
+Groomer login opens a personal workspace with Account settings and Attendance. Settings reuse Android profile/password endpoints: registered email is read-only, followed by name, address, phone and preferred store; passwords require at least six characters. English/Chinese selection lives in the shared Website settings page and is saved in this browser after confirmation. It is separate from account profile fields. Attendance defaults to the current Auckland calendar month with All stores selected and runs only after Search, supports store/date queries and queues the displayed records as a PDF to the registered email using the existing Android export flow.
+
+Manager, General manager and Owner open the exact same components through My account & attendance and can return to Management. Migration 013 provisions personal worker identities for existing management accounts without allocating new employee codes or changing their roles; new management identities are provisioned on first personal attendance access. Personal routes enforce own-record access regardless of management role. Store choices for personal profiles do not grant store-management permissions. Existing management roles, scopes and approval policies remain in effect.
+
+
+Daily hours in personal attendance and emailed PDFs use the same calculation. Records are grouped by Auckland date and sorted chronologically; effective pending changes are included and pending removals excluded, with totals marked pending approval. Each day must have an even count and chronologically ordered clock-in/clock-out pairs. Pair durations use elapsed time, round individually to two decimal hours and add integer hundredths. Invalid sequences show “Adjust attendance records” instead of a partial total. Query controls allow ranges of up to 31 days; changing controls clears previous results to keep exports aligned with the displayed query. Employees may edit both time and type; additions, changes and removals remain approval requests.
+
+The daily-hours table and PDF end with total hours across the queried range. Valid pending proposals are included and labeled “Changes awaiting manager confirmation”; the same label appears on a provisional range total. If any day has invalid pairs, no complete range total is displayed until records are adjusted. Totals add rounded daily hundredths without floating-point accumulation.
+
+Personal attendance queries and email exports accept an omitted/null shopId for all stores while retaining own-record scope. All-store rows and PDFs identify the store. Daily hours pair records within each store before adding the day total, preventing unrelated stores from completing each other’s incomplete pairs. Manual additions still require an explicit store.
+
+Personal attendance PDF attachments use landscape A4 with tables matching the personal query view: daily hours and total, followed by store/type/original/current/confirmed/status details. Multi-page tables repeat headers and include page numbers; Chinese uses the bundled CJK font.
+
+
+## Manager management workspace
+
+Management navigation has four functional areas: Store management (assigned store profiles and search), Employee management (assigned groomer profiles, search and invitation delivery tab), Attendance management (records and monthly working-hours tabs) and Approvals (latest add/update/remove proposals with explicit request type). Personal account/attendance and Website settings reuse the shared personal components. Attendance records show original/current/confirmed timestamps, requested type and photos. Existing role and scope checks remain enforced on every API operation: attendance uses store OR groomer assignment, profile editing uses the respective assignment, and only General manager activates new personnel. Pending records must be resolved through Approvals before direct manager corrections.
+
+All web roles now use WorkspaceLayout with a single shared sidebar. Attendance is the first feature for everyone; Groomer sees only that feature, while management features are added by role. Website settings, My account and Sign out are grouped at the bottom. Management no longer requires switching between separate personal and manager navigation templates.
+
+
+Attendance starts with Staff. Groomers have a fixed own-account field and continue using own-only APIs. Managers select only groomers linked through manager_workers, defaulting to all such groomers; GM/Owner can select all groomers. Dedicated /manager/staff-attendance and /manager/staff-attendance/staff endpoints enforce this narrower staff relationship independently of store-based attendance-management permissions. Daily totals are calculated per employee/date and then summed. Staff exports include employee names in tables and are emailed to the requesting account; permissions are rechecked on request retries and before mail delivery. Store-only assignments do not add staff to this selector.
+
+The sidebar now has one Attendance entry for all roles. Manager record actions, history, daily hours and the monthly-summary tab live under that entry; Attendance management is no longer a second sidebar destination. Validation queue remains directly below Attendance.
+
+Sidebar order: Groomer — Attendance; Manager — Attendance, Validation queue; GM/Owner — Attendance, Validation queue, Employee, Shops, Structure. Website settings, My account and Sign out stay in the shared footer. This navigation arrangement does not change existing API authorization rules.
+
+Employee codes retain the original 1000–9999 range, allocated randomly from unused codes. Migration 015 restores that constraint for Manager/GM after the temporary leading-zero allowance in 014. Store codes remain a separate 00xx range; uniqueness is enforced across all account codes.
+
+Website business role labels are General manager, Manager and Groomer. The former Employee label in navigation, profile lists and account creation is now Groomer; Employee ID remains the existing numeric identifier field. Internal WORKER enum/API names remain compatible with Android and existing data.
+
+Manager/GM/Owner attendance additions, changes and removals take effect immediately, with an approved history/audit entry and no pending validation item. The same rule applies to their own records through personal endpoints. Their own account appears in Staff; null-code management accounts use an authenticated self selector. Own records are permitted independently of store/groomer assignments. A direct manager change supersedes a pending employee proposal while retaining its rejected history. Groomer changes continue to require approval.
+
+Attendance Staff and Shop filters support checkbox multi-selection; empty selection means all permitted values. Groomer Staff remains fixed to self. GET requests accept comma-separated workerIds/shopIds, exports accept arrays, and legacy scalar workerId/shopId remain supported for Android. Every selected staff identity is validated against the current scope before queries/exports; a mixed authorized/unauthorized selection is rejected in full. Work hours remain grouped by employee, date and store pairing.
+
+Daily working-hour rows identify a single staff member, shop and Auckland date. View updates the staff/shop multi-selectors and both dates to that row and immediately queries its attendance records. Summaries and PDFs show a shop column to keep multi-shop drill-down unambiguous; total hours still sum all displayed rows.
+
+GM and Owner have an Attendance GPS page immediately after Structure. GET /manager/attendance/locations enforces these roles server-side, accepts multi-staff/shop filters and a date range up to 31 days, and pages 100 results. Dates refer to the original GPS-bearing attendance event. Records without complete valid numeric GPS coordinates are included, with blank GPS, distance and accuracy cells. Distances prefer the saved event distance, otherwise use saved store coordinates or current store coordinates for legacy records. This view does not enable or require new GPS collection.
+
+Missing clock-in/out issues in Validation queue now offer Review. The action opens Attendance and immediately queries the issue’s Auckland date, staff and shop, using the same selection helper as the daily-hours View button. An authorized single-shop review can resolve staff through store permission even when they are absent from the manager’s groomer assignments; ordinary all-staff selection is unchanged.
+
+
+## Automatic photo retention
+
+Migration 016 adds photo deletion timestamps and an expiry index. On backend startup and every 15 minutes, the retention worker deletes up to 200 READY photo files uploaded at least three calendar months ago (Pacific/Auckland). It supports private local files and S3 objects and catches up after restarts. File deletion succeeds before metadata is marked EXPIRED; failed deletions remain READY for retry. Missing local files count as already deleted. Per-photo locks prevent duplicate deletion by concurrent workers.
+
+Attendance rows, immutable photo associations and adjustment history are retained. Each deletion creates PHOTO_EXPIRED audit evidence. Photo access returns 410 after expiry, and the web UI labels the photo expired. No attendance records are deleted by this process. S3 credentials must allow DeleteObject for the configured photo bucket. S3 object version retention, if enabled separately on the bucket, is governed by that bucket’s lifecycle configuration.
