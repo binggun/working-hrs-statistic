@@ -1,0 +1,13 @@
+{
+  "versionName": "1.0.3",
+  "versionCode": 4,
+  "applicationId": "com.example.pawhub_signin_app",
+  "buildType": "release",
+  "minSdk": 26,
+  "sizeBytes": 6673264,
+  "sha256": "27a43fbfc2ce559d184c3447e297f2a0bdb8d7f9935f9fe2089af4c1ac92350d",
+  "builtAt": "2026-10-28T08:14:13.551316+00:00",
+  "publishedAt": "2026-10-28T08:15:51.487775+00:00",
+  "downloadUrl": "https://d38mx5j7wcje2a.cloudfront.net/releases/pawhub-v1.0.3.apk",
+  "certificateSha256": "f739289d76a89520d973cc4675a8145167dbf90dd5f3fee5977a169884c98508"
+}
