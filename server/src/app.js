@@ -989,7 +989,7 @@ app.post("/api/v1/attendance", async (req, res) => {
           [b.shopId],
         )
       ).rows[0];
-      if (!w || (!s && !(allowAllShops && !shopCode && req.account.role !== "SHOP"))) fail(422, "Unknown worker or shop");
+      if (!w || !s) fail(422, "Unknown worker or shop");
       if (req.account.role === "WORKER") {
         if (w.account_id !== req.account.id)
           fail(403, "Cannot sign for another worker");
