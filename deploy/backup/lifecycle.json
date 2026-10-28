@@ -1,0 +1,30 @@
+{
+  "Rules": [
+    {
+      "ID": "Database30Days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "database/"
+      },
+      "Expiration": {
+        "Days": 30
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 1
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    },
+    {
+      "ID": "RemoveExpiredDeleteMarkers",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "database/"
+      },
+      "Expiration": {
+        "ExpiredObjectDeleteMarker": true
+      }
+    }
+  ]
+}

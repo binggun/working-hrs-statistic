@@ -22,7 +22,7 @@ npm run dev
 
 In another terminal, from the repository root run `npm run dev:web`. API default port is 3000 and website development port is 5173. Use the existing checkout; no worktree is needed.
 
-Create people independently of shops. Groomers are not linked to shops; managers can view the shared groomer directory and manage groomer invitations. Accounts can be created and invited before any shops exist. Manager shop permissions still control attendance access. Create shops as Owner when needed. Owner and manager login use email; App users use four-digit IDs. Groomer activation and reset links open the static website's password page. Links are seven-day, single-use; production activation requires SMTP and the encryption key. Accounts remain pending until the user sets a password. No automatic demo accounts are created.
+Create people independently of shops. Groomers are not linked to shops; managers can view the shared groomer directory and manage groomer invitations. Accounts can be created and invited before any shops exist. Manager shop permissions still control attendance access. Create shops as Owner when needed. Owner and manager login use email; App users use four-digit IDs. All active shop accounts use the fixed login password `123456`; store creation does not require password setup. Existing shop passwords are no longer used. Employee and manager passwords are unchanged. Groomer activation and reset links open the static website's password page. Links are seven-day, single-use; production activation requires SMTP and the encryption key. Accounts remain pending until the user sets a password. No automatic demo accounts are created.
 
 `npm run build` creates static files under `web/dist`; `VITE_API_URL` is public build-time configuration, never put AWS keys there.
 
@@ -231,3 +231,15 @@ Missing clock-in/out issues in Validation queue now offer Review. The action ope
 Migration 016 adds photo deletion timestamps and an expiry index. On backend startup and every 15 minutes, the retention worker deletes up to 200 READY photo files uploaded at least three calendar months ago (Pacific/Auckland). It supports private local files and S3 objects and catches up after restarts. File deletion succeeds before metadata is marked EXPIRED; failed deletions remain READY for retry. Missing local files count as already deleted. Per-photo locks prevent duplicate deletion by concurrent workers.
 
 Attendance rows, immutable photo associations and adjustment history are retained. Each deletion creates PHOTO_EXPIRED audit evidence. Photo access returns 410 after expiry, and the web UI labels the photo expired. No attendance records are deleted by this process. S3 credentials must allow DeleteObject for the configured photo bucket. S3 object version retention, if enabled separately on the bucket, is governed by that bucket’s lifecycle configuration.
+
+## Android App download page
+
+The public page `/appdownload` and the shared Download Android App sidebar utility provide APK version, build date, size, SHA-256 and installation instructions. GET `/api/v1/downloads/android` returns available installer metadata; GET `/api/v1/downloads/android/apk?sha256=...` serves a hash-pinned APK with a friendly filename and Android package MIME type. No login is required to install the app.
+
+Publish an existing Android build from the repository root:
+
+```sh
+node server/scripts/publish-android.mjs /app/PawhubSigninApp/app/build/outputs/apk/debug/app-debug.apk
+```
+
+The sibling `output-metadata.json` supplies actual version/build metadata. Published files are stored under ignored `server/data/downloads` (override with ANDROID_APK_DIR); metadata updates are atomic and existing hash-pinned download links remain valid. The currently published 1.0 APK is the existing debug/test build from 2026-10-25; this page does not rebuild Android sources automatically.

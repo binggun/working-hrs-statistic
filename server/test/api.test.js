@@ -139,7 +139,7 @@ test(
       );
       const appLogin = await post(
         "/auth/login",
-        { accountId: shopCode, password },
+        { accountId: shopCode, password: "123456" },
         null,
       );
       const appToken = appLogin.data.data.sessionToken;
@@ -431,7 +431,7 @@ test(
         password,
       });
       const token2 = (
-        await post("/auth/login", { accountId: code2, password }, null)
+        await post("/auth/login", { accountId: code2, password: "123456" }, null)
       ).data.data.sessionToken;
       await post(
         "/attendance",
@@ -887,6 +887,7 @@ test(
       // Inject a local mail transport: no real emails are sent by integration tests.
       let delivered;
       await processAttendanceExports({ sendMail: async mail => { delivered = mail; } });
+      assert.ok(delivered, JSON.stringify((await pool.query("SELECT status,last_error_code FROM attendance_export_jobs WHERE id=$1", [exportJob.id])).rows));
       assert.equal(delivered.to, employeeEmail);
       assert.equal(delivered.subject, exportJob.subject);
       assert.equal(delivered.attachments[0].content.subarray(0, 4).toString(), "%PDF");

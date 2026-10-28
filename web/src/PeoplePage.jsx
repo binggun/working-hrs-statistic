@@ -32,7 +32,7 @@ export default function PeoplePage({ account, workers, managers, shops, api, bus
     ])} />;
   return <>
     <div className="d-flex flex-wrap align-items-center justify-content-between gap-3 mb-4">
-      <p className="text-secondary mb-0">Groomer profiles within your permission scope. New personnel require General manager approval.</p>
+      <p className="text-secondary mb-0">Owner-added personnel activate after setting a password. Self-registrations and personnel added by other managers require General manager approval.</p>
       <button className="btn btn-primary" disabled={busy} onClick={() => setEditor({ mode: "ADD", kind: "worker" })}>Add person</button>
     </div>
     <label className="form-label mb-3">Search groomers<input className="form-control mt-1" type="search" placeholder="Name, email or employee ID" value={search} onChange={event => setSearch(event.target.value)} /></label>
@@ -43,12 +43,12 @@ export default function PeoplePage({ account, workers, managers, shops, api, bus
     <h2 className="h3 mb-3">Groomers</h2>
     {table(workers, "worker")}
     {owner && <><h2 className="h3 mt-4 mb-3">Managers</h2>{table(managers.filter(p => p.role !== "GENERAL_MANAGER"), "manager")}</>}
-    {editor && <PersonDialog {...editor} owner={owner} shops={shops} api={api}
+    {editor && <PersonDialog {...editor} owner={owner} createdByOwner={account.role === "SUPER_MANAGER"} shops={shops} api={api}
       onClose={() => setEditor(null)} onDone={message => { setEditor(null); onChanged(message); }} />}
   </>;
 }
 
-function PersonDialog({ mode, person, kind, owner, shops, api, onClose, onDone }) {
+function PersonDialog({ mode, person, kind, owner, createdByOwner, shops, api, onClose, onDone }) {
   const dialog = useRef(null);
   const request = useRef(null);
   const [saving, setSaving] = useState(false);
@@ -119,7 +119,7 @@ function PersonDialog({ mode, person, kind, owner, shops, api, onClose, onDone }
             </select>
           </label>
         </div>
-        {mode === "ADD" && <p className="text-secondary mt-3">A password setup link will be emailed. All new personnel must be approved by the General manager before activation.</p>}
+        {mode === "ADD" && <p className="text-secondary mt-3">{createdByOwner ? "A password setup link will be emailed. Because you are the Owner, the account activates immediately after password setup; no GM approval is needed." : "A password setup link will be emailed. General manager approval is required before activation."}</p>}
       </fieldset>}
       <div className="d-flex justify-content-end gap-2 mt-4">
         <button type="button" className="btn" disabled={saving} onClick={onClose}>Cancel</button>

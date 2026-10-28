@@ -18,6 +18,7 @@ export default function WorkspaceLayout({ account, active, onNavigate, logout, l
         <nav className="nav flex-column w-100" aria-label={t("Features", "功能栏")}>{items.map(link)}</nav>
         <div className="workspace-sidebar-footer mt-auto w-100 pt-4">
           <nav className="nav flex-column w-100" aria-label={t("Website and account", "网站与账号")}>
+            <a className="nav-link text-start w-100" href="/appdownload">{t("Download Android App", "下载 Android App")}</a>
             {[["Settings", t("Website settings", "网站设置")], ["Profile", t("My account", "我的账号")]].map(link)}
           </nav>
           <button className="btn btn-sm w-100 mt-2" disabled={busy} onClick={logout}>{t("Sign out", "退出登录")}</button>

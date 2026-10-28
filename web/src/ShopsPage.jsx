@@ -20,7 +20,7 @@ function ShopDialog({ shop, api, onClose, onDone }) {
     const fields = Object.fromEntries(new FormData(e.currentTarget));
     if (!request.current) request.current = { url: shop.id ? `/manager/shops/${shop.id}/profile` : "/manager/shops",
       body: { operationId: operationId(), name: fields.name.trim(), address: fields.address.trim(),
-        ...(shop.id ? { expectedVersion: shop.profile_version } : { shopId: fields.shopId.trim(), password: fields.password }) } };
+        ...(shop.id ? { expectedVersion: shop.profile_version } : { shopId: fields.shopId.trim() }) } };
     setSaving(true); setFrozen(true); setError("");
     try { await api(request.current.url, { method: "POST", body: JSON.stringify(request.current.body) }); onDone(); }
     catch (e) { setError(e.message); if (e.status >= 400 && e.status < 500) { request.current = null; setFrozen(false); } }
@@ -32,7 +32,7 @@ function ShopDialog({ shop, api, onClose, onDone }) {
       {!shop.id && <label className="form-label mb-3">Store ID<input name="shopId" required pattern="00[0-9]{2}" className="form-control mt-1" placeholder="0001" /></label>}
       <label className="form-label mb-3">Store name<input name="name" required maxLength={200} defaultValue={shop.name || ""} className="form-control mt-1" /></label>
       <label className="form-label mb-3">Address<input name="address" required maxLength={500} defaultValue={shop.address || ""} className="form-control mt-1" /></label>
-      {!shop.id && <label className="form-label mb-3">Store password (6–128 characters)<input name="password" type="password" required minLength={6} maxLength={128} className="form-control mt-1" /></label>}
+      {!shop.id && <p className="text-secondary mb-0">Store login password: 123456. No password setup is required.</p>}
     </fieldset><div className="d-flex justify-content-end gap-2 mt-4"><button type="button" className="btn" disabled={saving} onClick={onClose}>Cancel</button><button className="btn btn-primary" disabled={saving}>{saving ? "Saving…" : "Save store"}</button></div>
   </form></dialog>;
 }

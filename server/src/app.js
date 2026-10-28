@@ -1,3 +1,5 @@
+import { SHOP_LOGIN_PASSWORD, passwordMatches } from "./shop-password.js";
+import { mountAndroidDownload } from "./android-download.js";
 import { attendanceLocation } from "./attendance-location.js";
 import { dailyAttendanceHours, totalAttendanceHours } from "./attendance-hours.js";
 import express from "express";
@@ -56,6 +58,7 @@ app.get("/api/v1/health", async (req, res) => {
   await pool.query("SELECT 1");
   res.json({ data: { status: "ok" } });
 });
+mountAndroidDownload(app);
 app.post(
   ["/api/v1/auth/login", "/api/v1/manager/auth/login"],
   rateLimit({ windowMs: 900000, limit: 30 }),
@@ -76,7 +79,7 @@ app.post(
     );
     const matches = [];
     for (const account of r.rows) {
-      if ((account.status === "ACTIVE" || (!manager && account.role === "WORKER" && account.status === "PENDING" && account.requires_manager_approval)) && account.password_hash && await argon2.verify(account.password_hash, b.password))
+      if ((account.status === "ACTIVE" || (!manager && account.role === "WORKER" && account.status === "PENDING" && account.requires_manager_approval)) && await passwordMatches(account, b.password))
         matches.push(account);
     }
     if (!matches.length) fail(401, "Invalid credentials", "INVALID_CREDENTIALS");
@@ -216,6 +219,7 @@ app.post("/api/v1/auth/logout", async (req, res) => {
   res.json({ data: { loggedOut: true } });
 });
 app.post("/api/v1/me/password", rateLimit({ windowMs: 900000, limit: 10 }), async (req, res) => {
+  if (req.account.role === "SHOP") fail(403, "Shop accounts use the fixed login password", "SHOP_FIXED_PASSWORD");
   const body = z.object({ currentPassword: z.string().min(1).max(1024), newPassword: z.string().min(6).max(128) }).strict().parse(req.body);
   await transaction(async (c) => {
     const account = (await c.query("SELECT * FROM accounts WHERE id=$1 FOR UPDATE", [req.account.id])).rows[0];
@@ -403,11 +407,10 @@ app.post("/api/v1/manager/shops", async (req, res) => {
       address: z.string().trim().min(1).max(500),
       latitude: z.number().min(-90).max(90).optional(),
       longitude: z.number().min(-180).max(180).optional(),
-      password: z.string().min(6).max(128),
     })
     .parse(req.body);
-  const pw = await argon2.hash(b.password);
-  const safe = { ...b, password: hash(b.password) };
+  const pw = await argon2.hash(SHOP_LOGIN_PASSWORD);
+  const safe = b;
   const data = await transaction((c) =>
     idem(c, req.account, safe, "SHOP_CREATE", async () => {
       const coordinates = b.latitude !== undefined && b.longitude !== undefined
@@ -570,7 +573,8 @@ app.post(
             "INSERT INTO account_shops(account_id,shop_id) VALUES($1,$2)",
             [a.id, s],
           );
-        await c.query("UPDATE accounts SET requires_manager_approval=true WHERE id=$1", [a.id]);
+        const requiresManagerApproval = req.account.role !== "SUPER_MANAGER";
+        await c.query("UPDATE accounts SET requires_manager_approval=$2,approved_by_account_id=CASE WHEN $2 THEN NULL ELSE $3::uuid END,approved_at=CASE WHEN $2 THEN NULL ELSE now() END WHERE id=$1", [a.id, requiresManagerApproval, req.account.id]);
         if (!isManager && req.account.role === "MANAGER") await c.query("INSERT INTO manager_workers(manager_account_id,worker_id) SELECT $1,id FROM workers WHERE account_id=$2 ON CONFLICT DO NOTHING", [req.account.id, a.id]);
         const invitationId = await invite(c, a);
         await audit(c, req.account, "ACCOUNT_CREATE", a.id);
@@ -578,6 +582,7 @@ app.post(
           accountId: a.id,
           workerId: code,
           activationStatus: "PENDING",
+          requiresManagerApproval,
           invitationId,
           emailStatus: "QUEUED",
         };
@@ -1176,6 +1181,25 @@ async function dailyAttendanceCount(c, workerId, shopId, day) {
     [workerId, shopId, zone, day],
   )).rows[0].count);
 }
+app.get("/api/v1/shops/:shopId/employees/:workerId", async (req, res) => {
+  if (req.account.role !== "SHOP") fail(403, "Shop account required");
+  const { shopId, workerId } = req.params;
+  if (!/^[0-9]{4}$/.test(shopId) || !/^[0-9]{4}$/.test(workerId))
+    fail(422, "Four-digit shop and employee IDs required");
+  const shop = (await pool.query(
+    "SELECT s.id FROM shops s JOIN accounts a ON a.id=s.account_id WHERE a.login_code=$1",
+    [shopId],
+  )).rows[0];
+  if (!shop) fail(404, "Shop not found");
+  await assertShop(pool, req.account, shop.id);
+  const worker = (await pool.query(
+    "SELECT a.login_code AS \"workerId\",a.name,a.requires_manager_approval FROM workers w JOIN accounts a ON a.id=w.account_id WHERE a.login_code=$1 AND a.role='WORKER' AND a.status='ACTIVE'",
+    [workerId],
+  )).rows[0];
+  if (!worker) fail(404, "Employee not found", "EMPLOYEE_NOT_FOUND");
+  if (worker.requires_manager_approval) fail(403, "Manager approval required", "MANAGER_APPROVAL_REQUIRED");
+  res.json({ data: { shopId, workerId: worker.workerId, name: worker.name } });
+});
 app.get("/api/v1/attendance/status", async (req, res) => {
   const code = req.query.workerId || req.account.login_code;
   const { w, s } = await appScope(req, pool, req.query.shopId, code);

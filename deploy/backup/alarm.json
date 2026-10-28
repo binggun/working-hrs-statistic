@@ -1,0 +1,23 @@
+{
+  "AlarmName": "Pawhub-DatabaseBackup-Unhealthy",
+  "AlarmDescription": "Backup failed, latest successful backup is older than 26 hours, or health heartbeat is missing. Check systemctl status pawhub-db-backup and journalctl -u pawhub-db-backup.",
+  "ActionsEnabled": true,
+  "AlarmActions": [
+    "arn:aws:sns:ap-southeast-2:877955776267:pawhub-backup-alerts"
+  ],
+  "MetricName": "Healthy",
+  "Namespace": "Pawhub/Backup",
+  "Statistic": "Minimum",
+  "Dimensions": [
+    {
+      "Name": "InstanceId",
+      "Value": "i-029c75dcc86a29857"
+    }
+  ],
+  "Period": 300,
+  "EvaluationPeriods": 2,
+  "DatapointsToAlarm": 2,
+  "Threshold": 1,
+  "ComparisonOperator": "LessThanThreshold",
+  "TreatMissingData": "breaching"
+}

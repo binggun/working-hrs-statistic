@@ -234,3 +234,6 @@
 .attendance-selfie-thumbnail img { width: 48px; height: 48px; border-radius: 50%; object-fit: cover; }
 .attendance-selfie-thumbnail a:focus-visible { outline: 2px solid #0f766e; outline-offset: 3px; }
 .attendance-selfie-placeholder { display: flex; width: 48px; height: 48px; border-radius: 50%; background: #eef2f6; align-items: center; justify-content: center; font-size: 10px; text-align: center; }
+.android-download-card { max-width: 800px; }
+.android-download-card dl dt, .android-download-card dl dd { margin-bottom: 12px; }
+.android-download-card li { margin: 8px 0; }

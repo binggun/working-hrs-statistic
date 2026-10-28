@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+import datetime,hashlib,json,os,pathlib,subprocess,sys,tempfile,time,uuid
+ROOT=pathlib.Path('/var/lib/pawhub-backup')
+CONFIG=json.loads(pathlib.Path('/etc/pawhub-backup.json').read_text())
+def run(args,**kw):
+    return subprocess.run(args,check=True,**kw)
+def aws(args,folder=None):
+    cmd=['docker','run','--rm','--network','host','--memory','192m','--cpus','0.25','-e','AWS_REGION=ap-southeast-2','-e','AWS_DEFAULT_REGION=ap-southeast-2','-e','AWS_MAX_ATTEMPTS=3','-e','AWS_RETRY_MODE=standard','-e','AWS_PAGER=']
+    if folder:cmd+=['-v',str(folder)+':/backup']
+    return run(cmd+[CONFIG['aws_image']]+args,stdout=subprocess.PIPE,text=True,timeout=180).stdout
+
+def save(name,data):
+    tmp=ROOT/(name+'.tmp');tmp.write_text(json.dumps(data,indent=2)+'\n');os.chmod(tmp,0o600);os.replace(tmp,ROOT/name)
+def metric():
+    try: state=json.loads((ROOT/'state.json').read_text())
+    except (FileNotFoundError,json.JSONDecodeError):state={}
+    healthy=int(state.get('status')=='success' and 0<=time.time()-state.get('last_success_epoch',0)<26*3600)
+    aws(['cloudwatch','put-metric-data','--namespace','Pawhub/Backup','--metric-data',json.dumps([{'MetricName':'Healthy','Dimensions':[{'Name':'InstanceId','Value':'i-029c75dcc86a29857'}],'Value':healthy,'Unit':'Count'}])])
+    print(json.dumps({'healthy':healthy,'checked_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+def backup():
+    previous={}
+    try:previous=json.loads((ROOT/'state.json').read_text())
+    except (FileNotFoundError,json.JSONDecodeError):pass
+    try:
+        with tempfile.TemporaryDirectory(prefix='run-',dir=ROOT) as temp:
+            folder=pathlib.Path(temp);dump=folder/'database.dump'
+            with dump.open('wb') as f:
+                run(['docker','exec',CONFIG['db_container'],'pg_dump','-U','pawhub','-d','pawhub','--format=custom','--lock-wait-timeout=30s'],stdout=f,timeout=600)
+            if dump.stat().st_size<1024:raise RuntimeError('Unexpectedly small database dump')
+            with dump.open('rb') as f:
+                run(['docker','exec','-i',CONFIG['db_container'],'pg_restore','--list'],stdin=f,stdout=subprocess.DEVNULL,timeout=60)
+            digest=hashlib.file_digest(dump.open('rb'),'sha256').hexdigest()
+            stamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
+            key='database/'+stamp+'-'+uuid.uuid4().hex[:8]+'.dump'
+            aws(['s3','cp','/backup/database.dump','s3://'+CONFIG['bucket']+'/'+key,'--sse','AES256','--checksum-algorithm','SHA256','--metadata','sha256='+digest,'--only-show-errors'],folder)
+            head=json.loads(aws(['s3api','head-object','--bucket',CONFIG['bucket'],'--key',key]))
+            if head['ContentLength']!=dump.stat().st_size or head.get('Metadata',{}).get('sha256')!=digest or head.get('ServerSideEncryption')!='AES256':raise RuntimeError('Uploaded backup verification failed')
+            state={'status':'success','last_success_epoch':int(time.time()),'timestamp_utc':stamp,'key':key,'sha256':digest,'bytes':dump.stat().st_size,'version_id':head.get('VersionId')}
+            (folder/'manifest.json').write_text(json.dumps(state,indent=2))
+            aws(['s3','cp','/backup/manifest.json','s3://'+CONFIG['bucket']+'/'+key+'.json','--sse','AES256','--only-show-errors'],folder)
+            save('state.json',state);print(json.dumps(state))
+    except Exception as exc:
+        previous.update(status='failed',last_failure_epoch=int(time.time()),error=type(exc).__name__)
+        save('state.json',previous)
+        try:metric()
+        except Exception:pass
+        raise
+    metric()
+
+if __name__=='__main__':
+    import fcntl
+    ROOT.mkdir(mode=0o700,parents=True,exist_ok=True)
+    if sys.argv[1:] == ['health']:metric()
+    else:
+        with (ROOT/'backup.lock').open('w') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            backup()

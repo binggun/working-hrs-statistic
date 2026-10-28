@@ -6,3 +6,11 @@ web/dist/
 coverage/
 
 server/data/
+
+# Deployment backups and private signing materials
+deploy/backups/
+*.dump
+*.sql.gz
+*.jks
+*.keystore
+*.pem

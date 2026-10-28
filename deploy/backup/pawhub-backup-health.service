@@ -1,0 +1,10 @@
+[Unit]
+Description=Publish Pawhub backup health heartbeat
+Wants=network-online.target
+After=network-online.target docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pawhub-db-backup health
+TimeoutStartSec=4min
+UMask=0077
+Nice=10

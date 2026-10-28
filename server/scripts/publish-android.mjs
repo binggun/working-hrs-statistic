@@ -1,0 +1,18 @@
+import {readFile,stat,mkdir,copyFile,rename,writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {createHash,randomUUID} from 'node:crypto';
+const source=path.resolve(process.argv[2]||'../PawhubSigninApp/app/build/outputs/apk/debug/app-debug.apk');
+const build=JSON.parse(await readFile(path.join(path.dirname(source),'output-metadata.json'),'utf8'));
+const element=build.elements.find(item=>item.outputFile===path.basename(source));
+if(!element||build.applicationId!=='com.example.pawhub_signin_app')throw Error('APK build metadata does not match Pawhub');
+const data=await readFile(source), info=await stat(source);
+if(data.subarray(0,2).toString()!=='PK')throw Error('Invalid APK archive');
+const sha256=createHash('sha256').update(data).digest('hex');
+const directory=process.env.ANDROID_APK_DIR||fileURLToPath(new URL('../data/downloads/',import.meta.url));
+await mkdir(directory,{recursive:true});
+await copyFile(source,path.join(directory,sha256+'.apk'));
+const metadata={versionName:element.versionName,versionCode:element.versionCode,applicationId:build.applicationId,buildType:build.variantName,minSdk:build.minSdkVersionForDexing,sizeBytes:data.length,sha256,builtAt:info.mtime.toISOString(),publishedAt:new Date().toISOString()};
+const temporary=path.join(directory,randomUUID()+'.json');
+await writeFile(temporary,JSON.stringify(metadata,null,2)+'\n');await rename(temporary,path.join(directory,'android.json'));
+console.log(JSON.stringify(metadata));

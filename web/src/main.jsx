@@ -2,6 +2,7 @@ import { DateTime } from "luxon";
 import { operationId } from "./operationId.js";
 import SiteSettings, { useSiteLanguage } from "./SiteSettings.jsx";
 import { attendanceSelectionForDay } from "./attendanceSelection.js";
+import AndroidDownloadPage from "./AndroidDownloadPage.jsx";
 import AttendanceLocationPage from "./AttendanceLocationPage.jsx";
 import WorkspaceLayout from "./WorkspaceLayout.jsx";
 import OrganizationPage from "./OrganizationPage.jsx";
@@ -296,6 +297,7 @@ function App() {
       URL.revokeObjectURL(url);
     });
   }
+  if (location.pathname.replace(/\/$/, "") === "/appdownload" || new URLSearchParams(location.search).get("download") === "android") return <main className="container-xl workspace-content"><div className="brand mb-4">Pawhub</div><AndroidDownloadPage language={language} /><a className="btn mt-4" href="/">{t("Back to website", "返回网站")}</a></main>;
   if (!session || activation)
     return (
       <div className="page page-center">
@@ -358,6 +360,7 @@ function App() {
               )}
             </div>
           </form>
+          <a className="btn btn-link w-100 mt-3" href="/appdownload">{t("Download Android App", "下载 Android App")}</a>
         </div>
       </div>
     );
@@ -377,7 +380,7 @@ function App() {
     setAttendanceInitial(null);
     setRows([]); setPage(value === "Records" ? "PersonalAttendance" : value); setCursor(""); setError(""); setNotice(""); setHistory(null);
   };
-  if (me.role === "WORKER" || ["PersonalAttendance", "Profile", "Settings"].includes(page)) return <WorkerPortal account={me} api={api} logout={logout} session={session}
+  if ((me.role === "WORKER" && page !== "Download") || ["PersonalAttendance", "Profile", "Settings"].includes(page)) return <WorkerPortal account={me} api={api} logout={logout} session={session}
     onAccountSaved={p => setMe(p)} language={language} onLanguage={setLanguage}
     initialSelection={attendanceInitial}
     view={page === "Profile" ? "profile" : page === "Settings" ? "settings" : "attendance"} navigationPage={page} onNavigate={navigate} />;
@@ -399,6 +402,7 @@ function App() {
                     Settings: language === "zh" ? "网站设置" : "Website settings",
                     Organization: t("Structure", "公司体系"),
                     Locations: t("Attendance GPS", "签到定位"),
+                    Download: t("Download Android App", "下载 Android App"),
                   }[page]
                 }
               </h1>
@@ -628,6 +632,7 @@ function App() {
           {page === "Shops" && <ShopsPage account={me} shops={shops} api={api} task={task} busy={busy} Table={Table}
             onChanged={message => { setNotice(message); setRefresh(x => x + 1); }} />}
           {page === "Settings" && <SiteSettings language={language} onLanguage={setLanguage} />}
+          {page === "Download" && <AndroidDownloadPage language={language} />}
           {page === "Locations" && ["GENERAL_MANAGER","SUPER_MANAGER"].includes(me.role) && <AttendanceLocationPage key={refresh} api={api} language={language} />}
           {page === "Organization" && <OrganizationPage account={me} api={api} onChanged={() => setRefresh(x => x + 1)} />}
 

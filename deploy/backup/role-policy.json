@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DatabaseBackupObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:AbortMultipartUpload",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::pawhub-signin-backups-877955776267/database/*"
+    },
+    {
+      "Sid": "BackupHealthMetrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "Pawhub/Backup"
+        }
+      }
+    }
+  ]
+}
