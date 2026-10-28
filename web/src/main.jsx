@@ -297,7 +297,17 @@ function App() {
       URL.revokeObjectURL(url);
     });
   }
-  if (location.pathname.replace(/\/$/, "") === "/appdownload" || new URLSearchParams(location.search).get("download") === "android") return <main className="container-xl workspace-content"><div className="brand mb-4">Pawhub</div><AndroidDownloadPage language={language} /><a className="btn mt-4" href="/">{t("Back to website", "返回网站")}</a></main>;
+  if (location.pathname.replace(/\/$/, "") === "/appdownload" || new URLSearchParams(location.search).get("download") === "android") return <main className="container-xl workspace-content" lang={language}>
+    <header className="d-flex align-items-center justify-content-between gap-3 mb-4">
+      <div className="brand">Pawhub</div>
+      <div className="btn-group" role="group" aria-label={t("Language", "语言")}>
+        <button type="button" className={`btn ${language === "en" ? "btn-primary" : "btn-outline-primary"}`} lang="en" aria-pressed={language === "en"} onClick={() => setLanguage("en")}>English</button>
+        <button type="button" className={`btn ${language === "zh" ? "btn-primary" : "btn-outline-primary"}`} lang="zh" aria-pressed={language === "zh"} onClick={() => setLanguage("zh")}>中文</button>
+      </div>
+    </header>
+    <AndroidDownloadPage language={language} />
+    <a className="btn mt-4" href="/">{t("Back to website", "返回网站")}</a>
+  </main>;
   if (!session || activation)
     return (
       <div className="page page-center">

@@ -83,6 +83,20 @@ Use a separate private S3 photo bucket, Block Public Access enabled. Set PHOTO_B
 
 Configure SMTP in `server/.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, and `MAIL_FROM`. Use your provider's SMTP password or app password. Port 587 uses `SMTP_SECURE=false` with required STARTTLS; port 465 uses `SMTP_SECURE=true`. TLS certificate verification remains enabled. Keep credentials only on the backend. Restart the API after changing configuration.
 
+For Resend, verify your sending domain in the Resend dashboard, create a sending API key, and configure:
+
+```dotenv
+MAIL_FROM=signin@pawhub.co.nz
+SMTP_HOST=smtp.resend.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=resend
+# Fill locally with your Resend API key. Never commit it.
+SMTP_PASS=
+```
+
+Resend uses the API key as the SMTP password; Gmail app passwords are not needed. Add the exact DNS records shown by Resend for sending-domain verification. Keep existing Gmail receiving MX records when configuring outbound sending only. Finish domain verification and fill in the API key before restarting the backend. Local `.env` changes do not update EC2; configure the same settings separately on the production server. Official setup: https://resend.com/docs/send-with-smtp.
+
 Set `WEB_ORIGIN` to the frontend address recipients can open (`http://localhost:5173` for local development; HTTPS in production). Set MAIL_ENCRYPTION_KEY to 32 cryptographically random bytes encoded as 64 hex characters and back it up securely: changing it without migrating queued encrypted invitations prevents delivery. The API processes one queued invitation approximately every minute with retry leases and five-minute retries. SENT means the SMTP server accepted the email, not guaranteed inbox delivery. SMTP is disabled while `SMTP_HOST` is unset; existing queued messages remain queued.
 
 
